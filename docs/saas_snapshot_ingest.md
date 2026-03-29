@@ -41,13 +41,20 @@ Discovery fields (unchanged):
 |-------|------|--------|
 | `objects` | array | Child BACnet objects (see below). Extra keys on the device row may appear if you customize the agent; safe to stash in JSON metadata. |
 
+## Snapshot read policy (edge agent)
+
+- Point properties are chosen **per BACnet object type** so `errors[]` stays small: e.g. no `units` on binary / multistate / character-string objects; file, program, trend-log, event-enrollment, notification-class rows only request **`object-name`** and **`description`** (plus **`present-value`** for **calendar**).
+- **`schedule`**: **`present-value`** is not read in bulk snapshots (BACpypes often returns constructed data that does not JSON cleanly); **`object_name`** / **`description`** still appear.
+- **`reliability`**: Always read for **analog-input** / **analog-output**; for **analog-value**, binary, multistate, character-string, **loop**, and unknown types the agent tries an **optional** read and only adds the field when the device answers (failures are not logged as errors).
+- **`to_json_safe`**: Any value that would become a Python `repr` string (e.g. `<… object at 0x…>`) is emitted as JSON **`null`** instead.
+
 ## Each `devices[].objects[]` element
 
 Core (existing):
 
 | Field | Type | Notes |
 |-------|------|--------|
-| `object_type` | string | BACnet type, camelCase, e.g. `analogInput`, `binaryValue`, `multiStateValue`. |
+| `object_type` | string | BACnet type: camelCase (`multiStateValue`) or kebab-case (`multi-state-value`, `binary-input`) depending on stack; SaaS should not assume one spelling. |
 | `object_instance` | int | |
 | `object_name` | string? | |
 | `description` | string? | |

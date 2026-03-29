@@ -88,12 +88,68 @@ async def _object_identifiers(app: Application, device_address: Address, device_
     return object_list
 
 
+def _object_type_kind_key(object_type: str) -> str:
+    """CamelCase, kebab-case, and snake_case names from BACnet stacks (e.g. multi-state-value)."""
+    return str(object_type).lower().replace("-", "").replace("_", "")
+
+
 def _is_binary_object_type(object_type: str) -> bool:
-    return str(object_type).lower().startswith("binary")
+    return _object_type_kind_key(object_type).startswith("binary")
 
 
 def _is_multistate_object_type(object_type: str) -> bool:
-    return str(object_type).lower().startswith("multistate")
+    return _object_type_kind_key(object_type).startswith("multistate")
+
+
+def _snapshot_property_plan(object_type: str) -> tuple[list[tuple[str, str]], bool]:
+    """
+    BACnet properties to read per object type (property id, JSON key).
+    The bool is True when we should try an extra optional (silent) reliability read
+    for stacks that expose it on BV/AV/etc.
+    """
+    k = _object_type_kind_key(object_type)
+    base: list[tuple[str, str]] = [
+        ("object-name", "object_name"),
+        ("description", "description"),
+    ]
+    if k.isdigit():
+        return base, False
+    meta_only = frozenset(
+        {
+            "file",
+            "notificationclass",
+            "eventenrollment",
+            "program",
+            "trendlog",
+            "trendlogmultiple",
+        }
+    )
+    if k in meta_only:
+        return base, False
+    if k == "schedule":
+        # present-value is often a constructed schedule; skip bulk read (avoids repr leaks).
+        return base, False
+    tail_pv = [
+        ("present-value", "present_value"),
+        ("status-flags", "status_flags"),
+        ("out-of-service", "out_of_service"),
+    ]
+    rel: tuple[str, str] = ("reliability", "reliability")
+    if k == "calendar":
+        return base + [("present-value", "present_value")], False
+    if k in ("analoginput", "analogoutput"):
+        return base + [("units", "units")] + tail_pv + [rel], False
+    if k == "analogvalue":
+        return base + [("units", "units")] + tail_pv, True
+    if (
+        k.startswith("binary")
+        or k.startswith("multistate")
+        or k == "characterstringvalue"
+    ):
+        return base + tail_pv, True
+    if k == "loop":
+        return base + tail_pv, True
+    return base + tail_pv, True
 
 
 def _coerce_present_value_active(pv: Any) -> Optional[bool]:
@@ -157,6 +213,8 @@ async def _snap_read_property(
     errors: list[dict[str, Any]],
     err_extra: dict[str, Any],
     array_index: Optional[int] = None,
+    *,
+    record_error: bool = True,
 ) -> Any:
     try:
         if array_index is not None:
@@ -170,15 +228,37 @@ async def _snap_read_property(
                 timeout=read_timeout,
             )
         if isinstance(val, ErrorRejectAbortNack):
-            errors.append({**err_extra, "property": prop, "message": str(val)})
+            if record_error:
+                errors.append({**err_extra, "property": prop, "message": str(val)})
             return None
         return val
     except ErrorRejectAbortNack as err:
-        errors.append({**err_extra, "property": prop, "message": str(err)})
+        if record_error:
+            errors.append({**err_extra, "property": prop, "message": str(err)})
         return None
     except Exception as e:
-        errors.append({**err_extra, "property": prop, "message": str(e)})
+        if record_error:
+            errors.append({**err_extra, "property": prop, "message": str(e)})
         return None
+
+
+def _iter_state_text_sequence(raw: Any) -> Optional[list[str]]:
+    if raw is None:
+        return None
+    if isinstance(raw, (str, bytes)):
+        return None
+    if isinstance(raw, (list, tuple)):
+        if not raw:
+            return None
+        return ["" if x is None else str(x) for x in raw]
+    try:
+        it = iter(raw)
+    except TypeError:
+        return None
+    items = list(it)
+    if not items:
+        return None
+    return ["" if x is None else str(x) for x in items]
 
 
 async def _read_multistate_state_text(
@@ -189,6 +269,21 @@ async def _read_multistate_state_text(
     errors: list[dict[str, Any]],
     err_extra: dict[str, Any],
 ) -> tuple[Optional[int], list[str]]:
+    # Some devices return the full array in one read; element-wise reads fail or are slow.
+    whole = await _snap_read_property(
+        app,
+        addr,
+        oid,
+        "state-text",
+        read_timeout,
+        errors,
+        err_extra,
+        record_error=False,
+    )
+    texts = _iter_state_text_sequence(whole)
+    if texts:
+        return len(texts), texts
+
     nraw = await _snap_read_property(
         app, addr, oid, "number-of-states", read_timeout, errors, err_extra
     )
@@ -200,7 +295,7 @@ async def _read_multistate_state_text(
         return None, []
     if n < 1:
         return n, []
-    texts: list[str] = []
+    out: list[str] = []
     for i in range(1, n + 1):
         part = await _snap_read_property(
             app,
@@ -212,8 +307,8 @@ async def _read_multistate_state_text(
             err_extra,
             array_index=i,
         )
-        texts.append("" if part is None else str(part))
-    return n, texts
+        out.append("" if part is None else str(part))
+    return n, out
 
 
 class BacnetPypesClient:
@@ -378,19 +473,26 @@ class BacnetPypesClient:
                     "object_type": ot,
                     "object_instance": oi,
                 }
-                for prop, key in (
-                    ("object-name", "object_name"),
-                    ("description", "description"),
-                    ("units", "units"),
-                    ("present-value", "present_value"),
-                    ("status-flags", "status_flags"),
-                    ("out-of-service", "out_of_service"),
-                    ("reliability", "reliability"),
-                ):
+                plan, try_optional_reliability = _snapshot_property_plan(ot)
+                for prop, key in plan:
                     val = await _snap_read_property(
                         app, addr, oid, prop, read_timeout, errors, err_obj
                     )
-                    entry[key] = val
+                    if val is not None:
+                        entry[key] = val
+                if try_optional_reliability:
+                    r = await _snap_read_property(
+                        app,
+                        addr,
+                        oid,
+                        "reliability",
+                        read_timeout,
+                        errors,
+                        err_obj,
+                        record_error=False,
+                    )
+                    if r is not None:
+                        entry["reliability"] = r
 
                 active_text: Optional[str] = None
                 inactive_text: Optional[str] = None

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+# BACpypes constructed values often stringify to Python repr, not a BACnet value.
+_REPR_LEAK = re.compile(r"^<[\w.]+ object at 0x[0-9a-f]+\>$", re.IGNORECASE)
 
 
 def to_json_safe(obj: Any) -> Any:
@@ -32,4 +36,7 @@ def to_json_safe(obj: Any) -> Any:
         return float(obj)
     except (TypeError, ValueError):
         pass
-    return str(obj)
+    s = str(obj)
+    if _REPR_LEAK.match(s.strip()):
+        return None
+    return s
