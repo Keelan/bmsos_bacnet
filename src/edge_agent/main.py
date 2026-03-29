@@ -9,6 +9,8 @@ import time
 import traceback
 from typing import Any, Optional, Union
 
+from bacpypes3.apdu import ErrorRejectAbortNack
+
 from edge_agent.bacnet_client import BacnetPypesClient
 from edge_agent.job_runner import run_job
 from edge_agent.mock_bacnet_client import MockBacnetClient
@@ -132,7 +134,8 @@ async def _run_forever(settings: Settings) -> None:
                 started = utc_now_iso()
                 try:
                     envelope = await run_job(job, bacnet, storage, settings)
-                except Exception as e:
+                except (ErrorRejectAbortNack, Exception) as e:
+                    # BACnet Error* types subclass BaseException, not Exception.
                     _log.exception("run_job_crashed job_id=%s", job.job_id)
                     envelope = JobResultEnvelope(
                         job_id=job.job_id,

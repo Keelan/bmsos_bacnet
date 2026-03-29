@@ -8,6 +8,8 @@ import os
 import re
 from typing import Any, Optional
 
+# ErrorRejectAbortNack subclasses BaseException, not Exception — BACnet errors
+# are not caught by `except Exception`.
 from bacpypes3.apdu import AbortPDU, AbortReason, ErrorRejectAbortNack
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
@@ -46,6 +48,9 @@ def _object_id_string(object_type: str, object_instance: int) -> str:
 async def _object_identifiers(app: Application, device_address: Address, device_identifier: ObjectIdentifier):
     try:
         object_list = await app.read_property(device_address, device_identifier, "object-list")
+        if isinstance(object_list, ErrorRejectAbortNack):
+            _log.debug("object-list error response: %s", object_list)
+            return []
         return list(object_list)
     except AbortPDU as err:
         if err.apduAbortRejectReason != AbortReason.segmentationNotSupported:
@@ -63,6 +68,9 @@ async def _object_identifiers(app: Application, device_address: Address, device_
             "object-list",
             array_index=0,
         )
+        if isinstance(object_list_length, ErrorRejectAbortNack):
+            _log.debug("object-list length error: %s", object_list_length)
+            return []
         for i in range(int(object_list_length)):
             oid = await app.read_property(
                 device_address,
@@ -70,6 +78,9 @@ async def _object_identifiers(app: Application, device_address: Address, device_
                 "object-list",
                 array_index=i + 1,
             )
+            if isinstance(oid, ErrorRejectAbortNack):
+                _log.debug("object-list element error: %s", oid)
+                break
             object_list.append(oid)
     except ErrorRejectAbortNack as err:
         _log.debug("object-list indexed err: %s", err)
@@ -150,6 +161,9 @@ class BacnetPypesClient:
         try:
             fut = app.who_is(0, 4194303, timeout=who_is_timeout)
             i_ams = await asyncio.wait_for(fut, timeout=who_is_timeout + 2.0)
+        except ErrorRejectAbortNack as e:
+            errors.append({"message": f"who_is failed: {e}"})
+            return devices, errors
         except Exception as e:
             errors.append({"message": f"who_is failed: {e}"})
             return devices, errors
@@ -189,6 +203,9 @@ class BacnetPypesClient:
                     _object_identifiers(app, addr, dev_obj_id),
                     timeout=read_timeout,
                 )
+            except ErrorRejectAbortNack as e:
+                errors.append({"device_instance": di, "message": f"object-list: {e}"})
+                continue
             except Exception as e:
                 errors.append({"device_instance": di, "message": f"object-list: {e}"})
                 continue
@@ -228,6 +245,17 @@ class BacnetPypesClient:
                             entry[key] = None
                         else:
                             entry[key] = val
+                    except ErrorRejectAbortNack as err:
+                        errors.append(
+                            {
+                                "device_instance": di,
+                                "object_type": str(oid[0]),
+                                "object_instance": oid[1],
+                                "property": prop,
+                                "message": str(err),
+                            }
+                        )
+                        entry[key] = None
                     except Exception as e:
                         errors.append(
                             {
@@ -259,6 +287,14 @@ class BacnetPypesClient:
                 i_ams_fut,
                 timeout=self._settings.who_is_timeout_seconds + 2.0,
             )
+        except ErrorRejectAbortNack as e:
+            return {
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "object_instance": object_instance,
+                "property": prop,
+                "error": str(e),
+            }
         except Exception as e:
             return {
                 "device_instance": device_instance,
@@ -300,6 +336,14 @@ class BacnetPypesClient:
                 "datatype": type(val).__name__,
                 "read_at": utc_now_iso(),
             }
+        except ErrorRejectAbortNack as err:
+            return {
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "object_instance": object_instance,
+                "property": prop,
+                "error": str(err),
+            }
         except Exception as e:
             return {
                 "device_instance": device_instance,
@@ -325,6 +369,8 @@ class BacnetPypesClient:
                 i_ams_fut,
                 timeout=self._settings.who_is_timeout_seconds + 2.0,
             )
+        except ErrorRejectAbortNack as e:
+            return {"error": str(e)}
         except Exception as e:
             return {"error": str(e)}
         if not i_ams:
@@ -353,6 +399,16 @@ class BacnetPypesClient:
                 "property": "presentValue",
                 "value": value,
                 "priority": priority,
+            }
+        except ErrorRejectAbortNack as err:
+            return {
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "object_instance": object_instance,
+                "property": "presentValue",
+                "value": value,
+                "priority": priority,
+                "error": str(err),
             }
         except Exception as e:
             return {

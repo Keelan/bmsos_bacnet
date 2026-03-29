@@ -7,6 +7,8 @@ import logging
 import traceback
 from typing import Any, Optional
 
+from bacpypes3.apdu import ErrorRejectAbortNack
+
 from edge_agent.models import (
     BacnetClient,
     JobModel,
@@ -82,7 +84,7 @@ async def run_job(
                 if rd.get("error"):
                     status = "failed"
                     errors.append({"message": str(rd["error"])})
-            except Exception as e:
+            except (ErrorRejectAbortNack, Exception) as e:
                 status = "failed"
                 summary = "Read failed"
                 data = {
@@ -129,7 +131,7 @@ async def run_job(
                         "detail": wr,
                     },
                 )
-            except Exception as e:
+            except (ErrorRejectAbortNack, Exception) as e:
                 status = "failed"
                 summary = "Write failed"
                 data = {
@@ -163,7 +165,7 @@ async def run_job(
         status = "failed"
         summary = "Job timed out"
         errors.append({"message": str(e)})
-    except Exception as e:
+    except (ErrorRejectAbortNack, Exception) as e:
         status = "failed"
         summary = f"Job error: {e}"
         errors.append({"message": str(e), "traceback": traceback.format_exc()})
