@@ -2,6 +2,8 @@
 
 Outbound-only agent: heartbeat, remote config, `jobs/next`, BACnet jobs, `result` POST.
 
+SaaS ingest spec for **`snapshot_network` `data`**: [docs/saas_snapshot_ingest.md](docs/saas_snapshot_ingest.md).
+
 ## Quick local test (mock BACnet)
 
 ```bash

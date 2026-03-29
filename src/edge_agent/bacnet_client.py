@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 import re
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 # ErrorRejectAbortNack subclasses BaseException, not Exception — BACnet errors
 # are not caught by `except Exception`.
@@ -86,6 +86,134 @@ async def _object_identifiers(app: Application, device_address: Address, device_
         _log.debug("object-list indexed err: %s", err)
 
     return object_list
+
+
+def _is_binary_object_type(object_type: str) -> bool:
+    return str(object_type).lower().startswith("binary")
+
+
+def _is_multistate_object_type(object_type: str) -> bool:
+    return str(object_type).lower().startswith("multistate")
+
+
+def _coerce_present_value_active(pv: Any) -> Optional[bool]:
+    """Map BACnet binary present-value (enum / int / str) to True=active, False=inactive."""
+    if pv is None:
+        return None
+    if isinstance(pv, bool):
+        return pv
+    name = getattr(pv, "name", None)
+    if isinstance(name, str):
+        n = name.lower()
+        if n == "active":
+            return True
+        if n == "inactive":
+            return False
+    s = str(pv).lower()
+    if s in ("active", "1", "true"):
+        return True
+    if s in ("inactive", "0", "false"):
+        return False
+    try:
+        i = int(pv)
+        if i == 1:
+            return True
+        if i == 0:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _present_value_label(
+    pv: Any,
+    object_type: str,
+    active_text: Optional[str],
+    inactive_text: Optional[str],
+    state_text: Optional[list[str]],
+) -> Optional[str]:
+    if _is_binary_object_type(object_type):
+        side = _coerce_present_value_active(pv)
+        if side is True:
+            return active_text or "active"
+        if side is False:
+            return inactive_text or "inactive"
+    if _is_multistate_object_type(object_type) and state_text:
+        try:
+            idx = int(pv) - 1
+            if 0 <= idx < len(state_text):
+                return state_text[idx]
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+async def _snap_read_property(
+    app: Application,
+    addr: Address,
+    oid: Union[ObjectIdentifier, str],
+    prop: str,
+    read_timeout: float,
+    errors: list[dict[str, Any]],
+    err_extra: dict[str, Any],
+    array_index: Optional[int] = None,
+) -> Any:
+    try:
+        if array_index is not None:
+            val = await asyncio.wait_for(
+                app.read_property(addr, oid, prop, array_index=array_index),
+                timeout=read_timeout,
+            )
+        else:
+            val = await asyncio.wait_for(
+                app.read_property(addr, oid, prop),
+                timeout=read_timeout,
+            )
+        if isinstance(val, ErrorRejectAbortNack):
+            errors.append({**err_extra, "property": prop, "message": str(val)})
+            return None
+        return val
+    except ErrorRejectAbortNack as err:
+        errors.append({**err_extra, "property": prop, "message": str(err)})
+        return None
+    except Exception as e:
+        errors.append({**err_extra, "property": prop, "message": str(e)})
+        return None
+
+
+async def _read_multistate_state_text(
+    app: Application,
+    addr: Address,
+    oid: ObjectIdentifier,
+    read_timeout: float,
+    errors: list[dict[str, Any]],
+    err_extra: dict[str, Any],
+) -> tuple[Optional[int], list[str]]:
+    nraw = await _snap_read_property(
+        app, addr, oid, "number-of-states", read_timeout, errors, err_extra
+    )
+    if nraw is None:
+        return None, []
+    try:
+        n = int(nraw)
+    except (TypeError, ValueError):
+        return None, []
+    if n < 1:
+        return n, []
+    texts: list[str] = []
+    for i in range(1, n + 1):
+        part = await _snap_read_property(
+            app,
+            addr,
+            oid,
+            "state-text",
+            read_timeout,
+            errors,
+            err_extra,
+            array_index=i,
+        )
+        texts.append("" if part is None else str(part))
+    return n, texts
 
 
 class BacnetPypesClient:
@@ -198,6 +326,8 @@ class BacnetPypesClient:
             di = int(d["device_instance"])
             addr = Address(d["address"])
             dev_obj_id = ObjectIdentifier(("device", di))
+            out_entry: dict[str, Any] = dict(d)
+
             try:
                 oids = await asyncio.wait_for(
                     _object_identifiers(app, addr, dev_obj_id),
@@ -210,13 +340,43 @@ class BacnetPypesClient:
                 errors.append({"device_instance": di, "message": f"object-list: {e}"})
                 continue
 
+            err_dev: dict[str, Any] = {"device_instance": di}
+            dev_oname = await _snap_read_property(
+                app, addr, dev_obj_id, "object-name", read_timeout, errors, err_dev
+            )
+            if dev_oname is not None:
+                nm = str(dev_oname)
+                out_entry["object_name"] = nm
+                out_entry["name"] = nm
+            for prop, key in (
+                ("description", "description"),
+                ("location", "location"),
+                ("vendor-name", "vendor_name"),
+                ("model-name", "model_name"),
+                ("firmware-revision", "firmware_revision"),
+                ("application-software-version", "application_software_version"),
+                ("protocol-version", "protocol_version"),
+            ):
+                v = await _snap_read_property(
+                    app, addr, dev_obj_id, prop, read_timeout, errors, err_dev
+                )
+                if v is not None:
+                    out_entry[key] = v
+
             objects: list[dict[str, Any]] = []
             for oid in oids:
                 if oid[0] == "device":
                     continue
+                ot = str(oid[0])
+                oi = int(oid[1])
+                err_obj: dict[str, Any] = {
+                    "device_instance": di,
+                    "object_type": ot,
+                    "object_instance": oi,
+                }
                 entry: dict[str, Any] = {
-                    "object_type": str(oid[0]),
-                    "object_instance": int(oid[1]),
+                    "object_type": ot,
+                    "object_instance": oi,
                 }
                 for prop, key in (
                     ("object-name", "object_name"),
@@ -227,50 +387,57 @@ class BacnetPypesClient:
                     ("out-of-service", "out_of_service"),
                     ("reliability", "reliability"),
                 ):
-                    try:
-                        val = await asyncio.wait_for(
-                            app.read_property(addr, oid, prop),
-                            timeout=read_timeout,
-                        )
-                        if isinstance(val, ErrorRejectAbortNack):
-                            errors.append(
-                                {
-                                    "device_instance": di,
-                                    "object_type": str(oid[0]),
-                                    "object_instance": oid[1],
-                                    "property": prop,
-                                    "message": str(val),
-                                }
-                            )
-                            entry[key] = None
-                        else:
-                            entry[key] = val
-                    except ErrorRejectAbortNack as err:
-                        errors.append(
-                            {
-                                "device_instance": di,
-                                "object_type": str(oid[0]),
-                                "object_instance": oid[1],
-                                "property": prop,
-                                "message": str(err),
-                            }
-                        )
-                        entry[key] = None
-                    except Exception as e:
-                        errors.append(
-                            {
-                                "device_instance": di,
-                                "object_type": str(oid[0]),
-                                "object_instance": oid[1],
-                                "property": prop,
-                                "message": str(e),
-                            }
-                        )
-                        entry[key] = None
-                objects.append(entry)
-            out_devices.append({"device_instance": di, "objects": objects})
+                    val = await _snap_read_property(
+                        app, addr, oid, prop, read_timeout, errors, err_obj
+                    )
+                    entry[key] = val
 
-        return {"snapshot_at": utc_now_iso(), "devices": out_devices}, errors
+                active_text: Optional[str] = None
+                inactive_text: Optional[str] = None
+                state_text: Optional[list[str]] = None
+                if _is_binary_object_type(ot):
+                    at = await _snap_read_property(
+                        app, addr, oid, "active-text", read_timeout, errors, err_obj
+                    )
+                    it = await _snap_read_property(
+                        app, addr, oid, "inactive-text", read_timeout, errors, err_obj
+                    )
+                    if at is not None:
+                        active_text = str(at)
+                        entry["active_text"] = active_text
+                    if it is not None:
+                        inactive_text = str(it)
+                        entry["inactive_text"] = inactive_text
+                elif _is_multistate_object_type(ot):
+                    n_states, texts = await _read_multistate_state_text(
+                        app, addr, oid, read_timeout, errors, err_obj
+                    )
+                    if n_states is not None:
+                        entry["number_of_states"] = n_states
+                    if texts:
+                        state_text = texts
+                        entry["state_text"] = texts
+
+                label = _present_value_label(
+                    entry.get("present_value"),
+                    ot,
+                    active_text,
+                    inactive_text,
+                    state_text,
+                )
+                if label is not None:
+                    entry["present_value_label"] = label
+
+                objects.append(entry)
+
+            out_entry["objects"] = objects
+            out_devices.append(out_entry)
+
+        return {
+            "snapshot_format_version": 2,
+            "snapshot_at": utc_now_iso(),
+            "devices": out_devices,
+        }, errors
 
     async def read_point(
         self,

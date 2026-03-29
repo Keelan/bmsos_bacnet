@@ -18,6 +18,8 @@ class MockBacnetClient:
                 "max_apdu": 1476,
                 "segmentation": "segmentedBoth",
                 "last_seen_at": now,
+                "name": "Mock FCU",
+                "object_name": "Mock FCU",
             }
         ]
         return devices, []
@@ -27,7 +29,6 @@ class MockBacnetClient:
         errors: list[dict[str, Any]] = list(errs)
         devices_out: list[dict[str, Any]] = []
         for d in devs:
-            inst = d["device_instance"]
             objects = [
                 {
                     "object_type": "analogValue",
@@ -39,10 +40,53 @@ class MockBacnetClient:
                     "status_flags": None,
                     "out_of_service": False,
                     "reliability": "noFaultDetected",
-                }
+                },
+                {
+                    "object_type": "binaryValue",
+                    "object_instance": 2,
+                    "object_name": "FanEnable",
+                    "description": None,
+                    "units": None,
+                    "present_value": 1,
+                    "active_text": "RUN",
+                    "inactive_text": "OFF",
+                    "present_value_label": "RUN",
+                    "status_flags": None,
+                    "out_of_service": False,
+                    "reliability": "noFaultDetected",
+                },
+                {
+                    "object_type": "multiStateValue",
+                    "object_instance": 3,
+                    "object_name": "OccMode",
+                    "description": None,
+                    "units": None,
+                    "present_value": 2,
+                    "number_of_states": 3,
+                    "state_text": ["Unocc", "Occ", "Bypass"],
+                    "present_value_label": "Occ",
+                    "status_flags": None,
+                    "out_of_service": False,
+                    "reliability": "noFaultDetected",
+                },
             ]
-            devices_out.append({"device_instance": inst, "objects": objects})
-        data = {"snapshot_at": utc_now_iso(), "devices": devices_out}
+            row = {
+                **d,
+                "description": "Mock device",
+                "location": "Lab",
+                "vendor_name": "MockVendor",
+                "model_name": "X-1",
+                "firmware_revision": "1.0.0",
+                "application_software_version": "1.2.3",
+                "protocol_version": 1,
+                "objects": objects,
+            }
+            devices_out.append(row)
+        data = {
+            "snapshot_format_version": 2,
+            "snapshot_at": utc_now_iso(),
+            "devices": devices_out,
+        }
         return data, errors
 
     async def read_point(
