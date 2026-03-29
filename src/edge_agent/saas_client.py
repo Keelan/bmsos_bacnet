@@ -8,6 +8,7 @@ import random
 from typing import Any, Optional
 
 import httpx
+from pydantic import ValidationError
 
 from edge_agent.models import ConfigPullResponse, NextJobResponse
 from edge_agent.settings import Settings
@@ -87,6 +88,7 @@ class SaasClient:
             return ConfigPullResponse(unchanged=True)
 
     async def next_job(self) -> NextJobResponse:
+        data: Any = None
         try:
             data = await self._post_json(
                 "/api/edge/v1/jobs/next",
@@ -96,7 +98,22 @@ class SaasClient:
                     "software_version": self._settings.software_version,
                 },
             )
-            return NextJobResponse.model_validate(data or {"job": None})
+            resp = NextJobResponse.model_validate(data or {"job": None})
+            if resp.job:
+                _log.info(
+                    "jobs_next_claimed job_id=%s type=%s",
+                    resp.job.job_id,
+                    resp.job.type,
+                )
+            return resp
+        except ValidationError as e:
+            job_blob = data.get("job") if isinstance(data, dict) else None
+            _log.warning(
+                "jobs_next_validation_failed job_blob=%r errors=%s",
+                job_blob,
+                e.errors(),
+            )
+            return NextJobResponse(job=None)
         except Exception as e:
             _log.warning("next_job_failed err=%s", e)
             return NextJobResponse(job=None)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class RemoteBacnetConfig(BaseModel):
@@ -53,9 +53,25 @@ def merge_bacnet(
 
 
 class JobModel(BaseModel):
-    job_id: str
-    type: str
-    payload: dict[str, Any] = Field(default_factory=dict)
+    """Laravel may use job_public_id / job_type; fake SaaS uses job_id / type."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    job_id: str = Field(
+        validation_alias=AliasChoices(
+            "job_id",
+            "job_public_id",
+            "public_id",
+            "id",
+        ),
+    )
+    type: str = Field(
+        validation_alias=AliasChoices("type", "job_type"),
+    )
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("payload"),
+    )
 
 
 class NextJobResponse(BaseModel):
