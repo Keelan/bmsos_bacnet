@@ -102,6 +102,15 @@ class BacnetClient(Protocol):
     async def snapshot_network(self, who_is_timeout: float, read_timeout: float) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         ...
 
+    async def read_device_live(
+        self,
+        device_instance: int,
+        read_timeout: float,
+        max_objects: int,
+        deadline_monotonic: Optional[float] = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        ...
+
     async def read_point(
         self,
         device_instance: int,
@@ -120,5 +129,6 @@ class BacnetClient(Protocol):
         value: Any,
         priority: Optional[int],
         write_timeout: float,
+        include_readback: bool = False,
     ) -> dict[str, Any]:
         ...

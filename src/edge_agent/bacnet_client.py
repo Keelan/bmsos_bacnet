@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Any, Optional, Union
 
 # ErrorRejectAbortNack subclasses BaseException, not Exception — BACnet errors
@@ -16,6 +17,7 @@ from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.pdu import Address
 from bacpypes3.primitivedata import ObjectIdentifier
 
+from edge_agent.json_safe import to_json_safe
 from edge_agent.models import EffectiveBacnetConfig, utc_now_iso
 from edge_agent.settings import Settings
 
@@ -311,6 +313,98 @@ async def _read_multistate_state_text(
     return n, out
 
 
+def _is_present_value_property(prop: str) -> bool:
+    p = prop.replace("present-value", "presentValue").strip().lower()
+    return p == "presentvalue"
+
+
+async def _build_snapshot_style_object_entry(
+    app: Application,
+    addr: Address,
+    device_instance: int,
+    object_type: str,
+    object_instance: int,
+    read_timeout: float,
+    errors: list[dict[str, Any]],
+    *,
+    present_value_precooked: Optional[Any] = None,
+) -> dict[str, Any]:
+    """One BACnet object's snapshot-shaped row (same keys as snapshot_network objects[])."""
+    ot = str(object_type)
+    oi = int(object_instance)
+    oid = _object_id_string(ot, oi)
+    err_obj: dict[str, Any] = {
+        "device_instance": device_instance,
+        "object_type": ot,
+        "object_instance": oi,
+    }
+    entry: dict[str, Any] = {
+        "object_type": ot,
+        "object_instance": oi,
+    }
+    plan, try_optional_reliability = _snapshot_property_plan(ot)
+    for prop, key in plan:
+        if present_value_precooked is not None and key == "present_value":
+            entry[key] = present_value_precooked
+            continue
+        val = await _snap_read_property(
+            app, addr, oid, prop, read_timeout, errors, err_obj
+        )
+        if val is not None:
+            entry[key] = val
+    if try_optional_reliability and "reliability" not in entry:
+        r = await _snap_read_property(
+            app,
+            addr,
+            oid,
+            "reliability",
+            read_timeout,
+            errors,
+            err_obj,
+            record_error=False,
+        )
+        if r is not None:
+            entry["reliability"] = r
+
+    active_text: Optional[str] = None
+    inactive_text: Optional[str] = None
+    state_text: Optional[list[str]] = None
+    if _is_binary_object_type(ot):
+        at = await _snap_read_property(
+            app, addr, oid, "active-text", read_timeout, errors, err_obj
+        )
+        it = await _snap_read_property(
+            app, addr, oid, "inactive-text", read_timeout, errors, err_obj
+        )
+        if at is not None:
+            active_text = str(at)
+            entry["active_text"] = active_text
+        if it is not None:
+            inactive_text = str(it)
+            entry["inactive_text"] = inactive_text
+    elif _is_multistate_object_type(ot):
+        n_states, texts = await _read_multistate_state_text(
+            app, addr, oid, read_timeout, errors, err_obj
+        )
+        if n_states is not None:
+            entry["number_of_states"] = n_states
+        if texts:
+            state_text = texts
+            entry["state_text"] = texts
+
+    label = _present_value_label(
+        entry.get("present_value"),
+        ot,
+        active_text,
+        inactive_text,
+        state_text,
+    )
+    if label is not None:
+        entry["present_value_label"] = label
+
+    return entry
+
+
 class BacnetPypesClient:
     """Wraps BACpypes3 Application; recreate via manager on config change."""
 
@@ -464,72 +558,9 @@ class BacnetPypesClient:
                     continue
                 ot = str(oid[0])
                 oi = int(oid[1])
-                err_obj: dict[str, Any] = {
-                    "device_instance": di,
-                    "object_type": ot,
-                    "object_instance": oi,
-                }
-                entry: dict[str, Any] = {
-                    "object_type": ot,
-                    "object_instance": oi,
-                }
-                plan, try_optional_reliability = _snapshot_property_plan(ot)
-                for prop, key in plan:
-                    val = await _snap_read_property(
-                        app, addr, oid, prop, read_timeout, errors, err_obj
-                    )
-                    if val is not None:
-                        entry[key] = val
-                if try_optional_reliability:
-                    r = await _snap_read_property(
-                        app,
-                        addr,
-                        oid,
-                        "reliability",
-                        read_timeout,
-                        errors,
-                        err_obj,
-                        record_error=False,
-                    )
-                    if r is not None:
-                        entry["reliability"] = r
-
-                active_text: Optional[str] = None
-                inactive_text: Optional[str] = None
-                state_text: Optional[list[str]] = None
-                if _is_binary_object_type(ot):
-                    at = await _snap_read_property(
-                        app, addr, oid, "active-text", read_timeout, errors, err_obj
-                    )
-                    it = await _snap_read_property(
-                        app, addr, oid, "inactive-text", read_timeout, errors, err_obj
-                    )
-                    if at is not None:
-                        active_text = str(at)
-                        entry["active_text"] = active_text
-                    if it is not None:
-                        inactive_text = str(it)
-                        entry["inactive_text"] = inactive_text
-                elif _is_multistate_object_type(ot):
-                    n_states, texts = await _read_multistate_state_text(
-                        app, addr, oid, read_timeout, errors, err_obj
-                    )
-                    if n_states is not None:
-                        entry["number_of_states"] = n_states
-                    if texts:
-                        state_text = texts
-                        entry["state_text"] = texts
-
-                label = _present_value_label(
-                    entry.get("present_value"),
-                    ot,
-                    active_text,
-                    inactive_text,
-                    state_text,
+                entry = await _build_snapshot_style_object_entry(
+                    app, addr, di, ot, oi, read_timeout, errors
                 )
-                if label is not None:
-                    entry["present_value_label"] = label
-
                 objects.append(entry)
 
             out_entry["objects"] = objects
@@ -540,6 +571,130 @@ class BacnetPypesClient:
             "snapshot_at": utc_now_iso(),
             "devices": out_devices,
         }, errors
+
+    async def read_device_live(
+        self,
+        device_instance: int,
+        read_timeout: float,
+        max_objects: int,
+        deadline_monotonic: Optional[float] = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Read snapshot-shaped object rows for one device (Explorer live panel)."""
+        app = self._require_app()
+        errors: list[dict[str, Any]] = []
+        read_at = utc_now_iso()
+        empty_data: dict[str, Any] = {
+            "device_instance": device_instance,
+            "read_at": read_at,
+            "objects": [],
+        }
+
+        i_ams_fut = app.who_is(
+            device_instance, device_instance, timeout=self._settings.who_is_timeout_seconds
+        )
+        try:
+            i_ams = await asyncio.wait_for(
+                i_ams_fut,
+                timeout=self._settings.who_is_timeout_seconds + 2.0,
+            )
+        except ErrorRejectAbortNack as e:
+            errors.append(
+                {"device_instance": device_instance, "message": f"who_is: {e}"}
+            )
+            return empty_data, errors
+        except Exception as e:
+            errors.append(
+                {"device_instance": device_instance, "message": f"who_is: {e}"}
+            )
+            return empty_data, errors
+
+        if not i_ams:
+            errors.append(
+                {
+                    "device_instance": device_instance,
+                    "message": "device not found (I-Am)",
+                }
+            )
+            return empty_data, errors
+
+        addr = Address(i_ams[0].pduSource)
+        dev_obj_id = ObjectIdentifier(("device", device_instance))
+
+        try:
+            oids = await asyncio.wait_for(
+                _object_identifiers(app, addr, dev_obj_id),
+                timeout=read_timeout,
+            )
+        except ErrorRejectAbortNack as e:
+            errors.append(
+                {
+                    "device_instance": device_instance,
+                    "message": f"object-list: {e}",
+                }
+            )
+            return empty_data, errors
+        except Exception as e:
+            errors.append(
+                {
+                    "device_instance": device_instance,
+                    "message": f"object-list: {e}",
+                }
+            )
+            return empty_data, errors
+
+        if not oids:
+            errors.append(
+                {
+                    "device_instance": device_instance,
+                    "message": "object-list empty or unreadable",
+                }
+            )
+            return empty_data, errors
+
+        non_dev = [o for o in oids if o[0] != "device"]
+        total_object_count = len(non_dev)
+        if total_object_count == 0:
+            errors.append(
+                {
+                    "device_instance": device_instance,
+                    "message": "no non-device objects in object-list",
+                }
+            )
+            return empty_data, errors
+
+        if max_objects and max_objects > 0:
+            to_process = non_dev[:max_objects]
+        else:
+            to_process = non_dev
+
+        truncated_by_count = len(to_process) < total_object_count
+        objects_out: list[dict[str, Any]] = []
+        truncated_by_time = False
+
+        for oid in to_process:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                truncated_by_time = True
+                break
+            ot = str(oid[0])
+            oi = int(oid[1])
+            entry = await _build_snapshot_style_object_entry(
+                app, addr, device_instance, ot, oi, read_timeout, errors
+            )
+            objects_out.append(entry)
+
+        returned_object_count = len(objects_out)
+        data: dict[str, Any] = {
+            "device_instance": device_instance,
+            "read_at": read_at,
+            "objects": objects_out,
+        }
+        truncated = truncated_by_count or truncated_by_time
+        if truncated:
+            data["truncated"] = True
+            data["total_object_count"] = total_object_count
+            data["returned_object_count"] = returned_object_count
+
+        return data, errors
 
     async def read_point(
         self,
@@ -583,6 +738,63 @@ class BacnetPypesClient:
         addr = Address(i_ams[0].pduSource)
         ois = _object_id_string(object_type, object_instance)
         prop_s = prop.replace("presentValue", "present-value")
+
+        if _is_present_value_property(prop):
+            try:
+                val = await asyncio.wait_for(
+                    app.read_property(addr, ois, "present-value"),
+                    timeout=read_timeout,
+                )
+                if isinstance(val, ErrorRejectAbortNack):
+                    return {
+                        "device_instance": device_instance,
+                        "object_type": object_type,
+                        "object_instance": object_instance,
+                        "property": prop,
+                        "error": str(val),
+                    }
+            except ErrorRejectAbortNack as err:
+                return {
+                    "device_instance": device_instance,
+                    "object_type": object_type,
+                    "object_instance": object_instance,
+                    "property": prop,
+                    "error": str(err),
+                }
+            except Exception as e:
+                return {
+                    "device_instance": device_instance,
+                    "object_type": object_type,
+                    "object_instance": object_instance,
+                    "property": prop,
+                    "error": str(e),
+                }
+
+            enrich_errors: list[dict[str, Any]] = []
+            entry = await _build_snapshot_style_object_entry(
+                app,
+                addr,
+                device_instance,
+                object_type,
+                object_instance,
+                read_timeout,
+                enrich_errors,
+                present_value_precooked=val,
+            )
+            read_ts = utc_now_iso()
+            out: dict[str, Any] = dict(entry)
+            out["device_instance"] = device_instance
+            out["object_type"] = object_type
+            out["object_instance"] = object_instance
+            out["property"] = prop
+            out["present_value"] = entry.get("present_value")
+            out["value"] = entry.get("present_value")
+            out["read_at"] = read_ts
+            out["datatype"] = type(val).__name__
+            if enrich_errors:
+                out["_property_errors"] = enrich_errors
+            return out
+
         try:
             val = await asyncio.wait_for(
                 app.read_property(addr, ois, prop_s),
@@ -630,6 +842,7 @@ class BacnetPypesClient:
         value: Any,
         priority: Optional[int],
         write_timeout: float,
+        include_readback: bool = False,
     ) -> dict[str, Any]:
         app = self._require_app()
         i_ams_fut = app.who_is(device_instance, device_instance, timeout=self._settings.who_is_timeout_seconds)
@@ -661,7 +874,7 @@ class BacnetPypesClient:
                     "priority": priority,
                     "error": str(resp),
                 }
-            return {
+            result: dict[str, Any] = {
                 "device_instance": device_instance,
                 "object_type": object_type,
                 "object_instance": object_instance,
@@ -669,6 +882,21 @@ class BacnetPypesClient:
                 "value": value,
                 "priority": priority,
             }
+            if include_readback:
+                rb_at = utc_now_iso()
+                try:
+                    pv = await asyncio.wait_for(
+                        app.read_property(addr, ois, "present-value"),
+                        timeout=write_timeout,
+                    )
+                    if isinstance(pv, ErrorRejectAbortNack):
+                        result["present_value_after"] = None
+                    else:
+                        result["present_value_after"] = to_json_safe(pv)
+                except (ErrorRejectAbortNack, Exception):
+                    result["present_value_after"] = None
+                result["read_at"] = rb_at
+            return result
         except ErrorRejectAbortNack as err:
             return {
                 "device_instance": device_instance,

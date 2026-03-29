@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import traceback
 from typing import Any, Optional
 
@@ -70,6 +71,87 @@ async def run_job(
                 summary = "Snapshot empty"
                 errors.append({"message": "No devices in snapshot"})
 
+        elif job.type == "read_device_live":
+            p = job.payload
+            dev = int(p["device_instance"])
+            max_obj = (
+                int(p["max_objects"])
+                if p.get("max_objects") is not None
+                else settings.read_device_live_max_objects
+            )
+            to_sec = (
+                float(p["timeout_seconds"])
+                if p.get("timeout_seconds") is not None
+                else settings.read_device_live_timeout_seconds
+            )
+            deadline = time.monotonic() + max(1.0, to_sec)
+            try:
+                live, derr = await asyncio.wait_for(
+                    bacnet.read_device_live(
+                        dev,
+                        settings.request_timeout_seconds,
+                        max_obj,
+                        deadline,
+                    ),
+                    timeout=max(to_sec + 5.0, 10.0),
+                )
+                errors.extend(derr)
+                for err in derr:
+                    if err.get("object_type") is not None:
+                        _log.warning(
+                            "read_device_live_object_issue job_id=%s device_instance=%s "
+                            "object_type=%s object_instance=%s message=%s",
+                            job.job_id,
+                            err.get("device_instance"),
+                            err.get("object_type"),
+                            err.get("object_instance"),
+                            err.get("message"),
+                        )
+                data = live
+                nob = len(live.get("objects", []))
+                if live.get("truncated"):
+                    summary = (
+                        f"Read {live.get('returned_object_count', nob)}/"
+                        f"{live.get('total_object_count', '?')} objects (truncated)"
+                    )
+                else:
+                    summary = f"Read {nob} objects"
+                if nob == 0:
+                    status = "failed"
+                    if derr and derr[0].get("message"):
+                        summary = str(derr[0]["message"])
+                    else:
+                        summary = "read_device_live: no objects"
+                elif derr:
+                    status = "partial_success"
+                else:
+                    status = "success"
+            except asyncio.TimeoutError as e:
+                status = "failed"
+                summary = "read_device_live timed out"
+                errors.append({"message": str(e), "device_instance": dev})
+                data = {
+                    "device_instance": dev,
+                    "read_at": utc_now_iso(),
+                    "objects": [],
+                }
+            except (ErrorRejectAbortNack, Exception) as e:
+                status = "failed"
+                summary = "read_device_live failed"
+                errors.append(
+                    {
+                        "message": str(e),
+                        "device_instance": dev,
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+                _log.exception("read_device_live job_id=%s", job.job_id)
+                data = {
+                    "device_instance": dev,
+                    "read_at": utc_now_iso(),
+                    "objects": [],
+                }
+
         elif job.type == "read_point":
             p = job.payload
             dev = int(p["device_instance"])
@@ -81,11 +163,16 @@ async def run_job(
                     bacnet.read_point(dev, ot, oi, prop, settings.request_timeout_seconds),
                     timeout=settings.request_timeout_seconds + 5.0,
                 )
+                pe = rd.pop("_property_errors", None)
+                if pe:
+                    errors.extend(pe)
                 data = rd
                 summary = "Read OK"
                 if rd.get("error"):
                     status = "failed"
                     errors.append({"message": str(rd["error"])})
+                elif pe:
+                    status = "partial_success"
             except (ErrorRejectAbortNack, Exception) as e:
                 status = "failed"
                 summary = "Read failed"
@@ -106,10 +193,17 @@ async def run_job(
             pri: Optional[int] = None
             if p.get("priority") is not None:
                 pri = int(p["priority"])
+            include_readback = bool(p.get("include_readback"))
             try:
                 wr = await asyncio.wait_for(
                     bacnet.write_point(
-                        dev, ot, oi, val, pri, settings.request_timeout_seconds
+                        dev,
+                        ot,
+                        oi,
+                        val,
+                        pri,
+                        settings.request_timeout_seconds,
+                        include_readback=include_readback,
                     ),
                     timeout=settings.request_timeout_seconds + 5.0,
                 )

@@ -4,6 +4,8 @@ Outbound-only agent: heartbeat, remote config, `jobs/next`, BACnet jobs, `result
 
 SaaS ingest spec for **`snapshot_network` `data`**: [docs/saas_snapshot_ingest.md](docs/saas_snapshot_ingest.md).
 
+Edge **job types, payloads, and result JSON** (including `read_device_live`, enriched `read_point`, `write_point` + `include_readback`): [docs/edge_jobs_contract.md](docs/edge_jobs_contract.md).
+
 ## Quick local test (mock BACnet)
 
 ```bash

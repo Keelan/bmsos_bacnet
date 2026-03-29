@@ -33,6 +33,8 @@ class Settings(BaseSettings):
 
     software_version: str = "0.1.0"
     who_is_timeout_seconds: float = 5.0
+    read_device_live_max_objects: int = 500
+    read_device_live_timeout_seconds: float = 120.0
     saas_max_retries: int = 5
     saas_retry_backoff_seconds: float = 0.5
 
