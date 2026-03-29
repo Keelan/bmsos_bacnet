@@ -15,6 +15,8 @@ from edge_agent.models import (
     BacnetClient,
     JobModel,
     JobResultEnvelope,
+    apply_float_tuning,
+    apply_int_tuning,
     utc_now_iso,
 )
 from edge_agent.settings import Settings
@@ -35,11 +37,30 @@ async def run_job(
     summary = ""
     status: str = "success"
 
+    tuning = storage.get_remote_agent_tuning()
+    who_timeout = apply_float_tuning(
+        settings.who_is_timeout_seconds, tuning, "who_is_timeout_seconds", 1.0, 120.0
+    )
+    read_live_max_default = apply_int_tuning(
+        settings.read_device_live_max_objects,
+        tuning,
+        "read_device_live_max_objects",
+        1,
+        10000,
+    )
+    read_live_timeout_default = apply_float_tuning(
+        settings.read_device_live_timeout_seconds,
+        tuning,
+        "read_device_live_timeout_seconds",
+        10.0,
+        600.0,
+    )
+
     try:
         if job.type == "discover_network":
             devices, derr = await asyncio.wait_for(
-                bacnet.discover_network(settings.who_is_timeout_seconds),
-                timeout=settings.who_is_timeout_seconds + 5.0,
+                bacnet.discover_network(who_timeout),
+                timeout=who_timeout + 5.0,
             )
             errors.extend(derr)
             data = to_json_safe({"discovered_at": utc_now_iso(), "devices": devices})
@@ -53,7 +74,7 @@ async def run_job(
         elif job.type == "snapshot_network":
             snap, serr = await asyncio.wait_for(
                 bacnet.snapshot_network(
-                    settings.who_is_timeout_seconds,
+                    who_timeout,
                     settings.request_timeout_seconds,
                 ),
                 timeout=600.0,
@@ -77,12 +98,12 @@ async def run_job(
             max_obj = (
                 int(p["max_objects"])
                 if p.get("max_objects") is not None
-                else settings.read_device_live_max_objects
+                else read_live_max_default
             )
             to_sec = (
                 float(p["timeout_seconds"])
                 if p.get("timeout_seconds") is not None
-                else settings.read_device_live_timeout_seconds
+                else read_live_timeout_default
             )
             deadline = time.monotonic() + max(1.0, to_sec)
             try:

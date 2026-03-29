@@ -44,7 +44,9 @@ def _camel_to_kebab(name: str) -> str:
 
 
 def _object_id_string(object_type: str, object_instance: int) -> str:
-    return f"{_camel_to_kebab(object_type)} {object_instance}"
+    # BACpypes3 ObjectIdentifier string parsing requires "type,instance" or "type:instance"
+    # (a space separator is rejected and breaks every read_property on objects).
+    return f"{_camel_to_kebab(object_type)},{object_instance}"
 
 
 async def _object_identifiers(app: Application, device_address: Address, device_identifier: ObjectIdentifier):
@@ -419,15 +421,17 @@ class BacnetPypesClient:
         # Always pass bind/instance/vendor on the CLI so .env values apply.
         parser = SimpleArgumentParser()
         cli = [
+            "--name",
+            self._effective.device_name,
             "--instance",
             str(self._effective.device_instance),
             "--vendoridentifier",
-            "999",
+            str(self._effective.vendor_identifier),
         ]
         if self._effective.bind_ip.strip():
             addr = format_bacpypes_device_address(
                 self._effective.bind_ip,
-                self._settings.bacnet_bind_prefix,
+                self._effective.bind_prefix,
                 self._effective.udp_port,
             )
             cli.extend(["--address", addr])
@@ -442,14 +446,15 @@ class BacnetPypesClient:
         addr_log = (
             format_bacpypes_device_address(
                 self._effective.bind_ip,
-                self._settings.bacnet_bind_prefix,
+                self._effective.bind_prefix,
                 self._effective.udp_port,
             )
             if self._effective.bind_ip.strip()
             else "(default host)"
         )
         _log.info(
-            "bacnet_stack_started device_instance=%s address=%s",
+            "bacnet_stack_started name=%s device_instance=%s address=%s",
+            self._effective.device_name,
             self._effective.device_instance,
             addr_log,
         )

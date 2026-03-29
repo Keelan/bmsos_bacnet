@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 from pydantic import TypeAdapter
 
-from edge_agent.models import RemoteBacnetConfig, utc_now_iso
+from edge_agent.models import RemoteAgentTuning, RemoteBacnetConfig, utc_now_iso
 
 
 class Storage:
@@ -50,18 +50,44 @@ class Storage:
             )
             self._conn.commit()
 
-    def get_remote_config_state(self) -> tuple[Optional[int], Optional[RemoteBacnetConfig]]:
+    def get_stored_remote_config_dict(self) -> Optional[dict[str, Any]]:
         raw = self.kv_get("remote_config")
         if not raw:
+            return None
+        return json.loads(raw)
+
+    def get_remote_config_state(self) -> tuple[Optional[int], Optional[RemoteBacnetConfig]]:
+        data = self.get_stored_remote_config_dict()
+        if not data:
             return None, None
-        data = json.loads(raw)
         rev = data.get("revision")
         bacnet = data.get("bacnet")
         cfg = TypeAdapter(RemoteBacnetConfig).validate_python(bacnet) if bacnet else None
         return rev, cfg
 
-    def save_remote_config(self, revision: int, updated_at: str, bacnet: dict[str, Any]) -> None:
-        payload = json.dumps({"revision": revision, "updated_at": updated_at, "bacnet": bacnet})
+    def get_remote_agent_tuning(self) -> Optional[RemoteAgentTuning]:
+        data = self.get_stored_remote_config_dict()
+        if not data:
+            return None
+        agent = data.get("agent")
+        if not agent or not isinstance(agent, dict):
+            return None
+        return TypeAdapter(RemoteAgentTuning).validate_python(agent)
+
+    def save_remote_config(
+        self,
+        revision: int,
+        updated_at: str,
+        bacnet: dict[str, Any],
+        agent: dict[str, Any],
+    ) -> None:
+        doc: dict[str, Any] = {
+            "revision": revision,
+            "updated_at": updated_at,
+            "bacnet": bacnet,
+            "agent": agent,
+        }
+        payload = json.dumps(doc)
         self.kv_set("remote_config", payload)
 
     def save_latest_discovery(self, doc: dict[str, Any]) -> None:

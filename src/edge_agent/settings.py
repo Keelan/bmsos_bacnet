@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # Subnet prefix for BACnet/IP bind. BACpypes3 treats "ip:port" without mask as /32 → no broadcast.
     bacnet_bind_prefix: int = 24
     bacnet_udp_port: int = 47808
+    # Local device object-name (BACpypes `--name`); remote config can override.
+    bacnet_device_name: str = "Excelsior"
+    bacnet_vendor_identifier: int = 999
     bacnet_mock: bool = False
 
     software_version: str = "0.1.0"

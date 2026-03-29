@@ -14,12 +14,29 @@ class RemoteBacnetConfig(BaseModel):
     device_instance: Optional[int] = None
     bind_ip: Optional[str] = None
     udp_port: Optional[int] = None
+    # BACnet object-name for this device (BACpypes `--name`).
+    device_name: Optional[str] = None
+    # IP subnet prefix for bind (e.g. 24); required for broadcast Who-Is on many networks.
+    bind_prefix: Optional[int] = None
+    vendor_identifier: Optional[int] = None
+
+
+class RemoteAgentTuning(BaseModel):
+    """Optional SaaS `agent` JSON — overrides env defaults until next config push."""
+
+    poll_interval_seconds: Optional[float] = None
+    heartbeat_interval_seconds: Optional[float] = None
+    config_poll_interval_seconds: Optional[float] = None
+    who_is_timeout_seconds: Optional[float] = None
+    read_device_live_max_objects: Optional[int] = None
+    read_device_live_timeout_seconds: Optional[float] = None
 
 
 class ConfigPullResponse(BaseModel):
     revision: Optional[int] = None
     updated_at: Optional[str] = None
     bacnet: Optional[RemoteBacnetConfig] = None
+    agent: Optional[RemoteAgentTuning] = None
     unchanged: bool = False
 
 
@@ -27,18 +44,27 @@ class EffectiveBacnetConfig(BaseModel):
     device_instance: int
     bind_ip: str
     udp_port: int
+    device_name: str
+    bind_prefix: int
+    vendor_identifier: int
 
 
 def merge_bacnet(
     settings_device_instance: int,
     settings_bind_ip: str,
     settings_udp_port: int,
+    settings_device_name: str,
+    settings_bind_prefix: int,
+    settings_vendor_identifier: int,
     remote: Optional[RemoteBacnetConfig],
 ) -> EffectiveBacnetConfig:
     eff = EffectiveBacnetConfig(
         device_instance=settings_device_instance,
         bind_ip=settings_bind_ip,
         udp_port=settings_udp_port,
+        device_name=settings_device_name.strip() or "Excelsior",
+        bind_prefix=int(settings_bind_prefix),
+        vendor_identifier=int(settings_vendor_identifier),
     )
     if not remote:
         return eff
@@ -49,6 +75,12 @@ def merge_bacnet(
         eff.bind_ip = remote.bind_ip
     if remote.udp_port is not None:
         eff.udp_port = remote.udp_port
+    if remote.device_name is not None and remote.device_name.strip():
+        eff.device_name = remote.device_name.strip()
+    if remote.bind_prefix is not None:
+        eff.bind_prefix = int(remote.bind_prefix)
+    if remote.vendor_identifier is not None:
+        eff.vendor_identifier = int(remote.vendor_identifier)
     return eff
 
 
@@ -90,6 +122,38 @@ class JobResultEnvelope(BaseModel):
 
 def utc_now_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def apply_float_tuning(
+    base: float,
+    tuning: Optional[RemoteAgentTuning],
+    field: str,
+    lo: float,
+    hi: float,
+) -> float:
+    if tuning is None:
+        return base
+    v = getattr(tuning, field, None)
+    if v is None:
+        return base
+    x = float(v)
+    return max(lo, min(hi, x))
+
+
+def apply_int_tuning(
+    base: int,
+    tuning: Optional[RemoteAgentTuning],
+    field: str,
+    lo: int,
+    hi: int,
+) -> int:
+    if tuning is None:
+        return base
+    v = getattr(tuning, field, None)
+    if v is None:
+        return base
+    x = int(v)
+    return max(lo, min(hi, x))
 
 
 @runtime_checkable

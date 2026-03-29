@@ -16,7 +16,9 @@ from edge_agent.job_runner import run_job
 from edge_agent.mock_bacnet_client import MockBacnetClient
 from edge_agent.models import (
     BacnetClient,
+    ConfigPullResponse,
     JobResultEnvelope,
+    apply_float_tuning,
     merge_bacnet,
     utc_now_iso,
 )
@@ -45,6 +47,9 @@ def _load_effective(settings: Settings, storage: Storage):
         settings.bacnet_device_instance,
         settings.bacnet_bind_ip,
         settings.bacnet_udp_port,
+        settings.bacnet_device_name,
+        settings.bacnet_bind_prefix,
+        settings.bacnet_vendor_identifier,
         remote,
     )
 
