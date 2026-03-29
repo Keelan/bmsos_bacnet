@@ -1,0 +1,15 @@
+[Unit]
+Description=BACnet edge agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/edge-agent
+EnvironmentFile=/opt/edge-agent/.env
+ExecStart=/opt/edge-agent/.venv/bin/python -m edge_agent
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
