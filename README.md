@@ -28,7 +28,33 @@ Inspect results: `curl -s http://127.0.0.1:8765/dev/results | jq`.
 
 ## Real BACnet (Linux)
 
-Set `BACNET_MOCK=false`, set `BACNET_BIND_IP` if needed, run on a host with BACnet/IP multicast to the target subnet.
+- Set `BACNET_MOCK=false`.
+- Set `BACNET_BIND_IP` to the interface IPv4 on the BACnet LAN.
+- Set `BACNET_BIND_PREFIX` (e.g. `24`) so the stack binds as `ip/24:47808`. **Bare `ip:port` is treated as /32 by BACpypes3 and breaks Who-Is** (`RuntimeError: no broadcast`). Alternatively put CIDR in `BACNET_BIND_IP` (e.g. `192.168.1.5/24`).
+
+## Update on a staging / production device
+
+```bash
+cd /opt/bmsos   # or your install path
+git pull
+source .venv/bin/activate
+pip install -e .
+```
+
+Edit **`.env`** (never commit it):
+
+- Add **`BACNET_BIND_PREFIX=24`** (or your real prefix) if `BACNET_BIND_IP` is only an address like `192.168.254.171`.
+- Keep **`SAAS_BASE_URL`**, **`BOX_ID`**, **`API_TOKEN`**, etc.
+
+Run:
+
+```bash
+python -m edge_agent
+```
+
+Or with systemd: `sudo systemctl restart edge-agent` after `git pull` + `pip install -e .`.
+
+You no longer need to export **`BACPYPES_DEVICE_ADDRESS`** manually; the agent sets **`ip/prefix:port`** from `.env`.
 
 ## systemd
 

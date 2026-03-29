@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +26,8 @@ class Settings(BaseSettings):
 
     bacnet_device_instance: int = 59999
     bacnet_bind_ip: str = ""
+    # Subnet prefix for BACnet/IP bind. BACpypes3 treats "ip:port" without mask as /32 → no broadcast.
+    bacnet_bind_prefix: int = 24
     bacnet_udp_port: int = 47808
     bacnet_mock: bool = False
 

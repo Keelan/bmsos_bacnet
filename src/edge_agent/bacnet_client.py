@@ -20,6 +20,20 @@ from edge_agent.settings import Settings
 _log = logging.getLogger(__name__)
 
 
+def format_bacpypes_device_address(bind_ip: str, bind_prefix: int, udp_port: int) -> str:
+    """
+    BACpypes3 parses bare ip:port as /32; then addrBroadcastTuple == addrTuple and
+    Who-Is (LocalBroadcast) raises RuntimeError('no broadcast'). Use ip/prefix:port.
+    If bind_ip already contains '/' (e.g. 192.168.1.5/24), only append :port.
+    """
+    ip = bind_ip.strip()
+    if not ip:
+        return ""
+    if "/" in ip:
+        return f"{ip}:{udp_port}"
+    return f"{ip}/{int(bind_prefix)}:{udp_port}"
+
+
 def _camel_to_kebab(name: str) -> str:
     s1 = re.sub("(.)([A-Z][a-z]+)", r"\1-\2", name)
     return re.sub("([a-z0-9])([A-Z])", r"\1-\2", s1).lower()
@@ -75,8 +89,10 @@ class BacnetPypesClient:
         os.environ["BACPYPES_DEVICE_INSTANCE"] = str(self._effective.device_instance)
         os.environ["BACPYPES_VENDOR_IDENTIFIER"] = "999"
         if self._effective.bind_ip:
-            os.environ["BACPYPES_DEVICE_ADDRESS"] = (
-                f"{self._effective.bind_ip}:{self._effective.udp_port}"
+            os.environ["BACPYPES_DEVICE_ADDRESS"] = format_bacpypes_device_address(
+                self._effective.bind_ip,
+                self._settings.bacnet_bind_prefix,
+                self._effective.udp_port,
             )
         elif "BACPYPES_DEVICE_ADDRESS" in os.environ:
             del os.environ["BACPYPES_DEVICE_ADDRESS"]
