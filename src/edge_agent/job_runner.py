@@ -210,68 +210,152 @@ async def run_job(
             dev = int(p["device_instance"])
             ot = str(p["object_type"])
             oi = int(p["object_instance"])
-            val = p["value"]
-            pri: Optional[int] = None
-            if p.get("priority") is not None:
-                pri = int(p["priority"])
             include_readback = bool(p.get("include_readback"))
-            try:
-                wr = await asyncio.wait_for(
-                    bacnet.write_point(
-                        dev,
-                        ot,
-                        oi,
-                        val,
-                        pri,
-                        settings.request_timeout_seconds,
-                        include_readback=include_readback,
-                    ),
-                    timeout=settings.request_timeout_seconds + 5.0,
-                )
-                if wr.get("error"):
+            rb_props = p.get("readback_properties")
+            if rb_props is not None and not isinstance(rb_props, list):
+                rb_props = None
+            writes_list = p.get("writes")
+
+            if isinstance(writes_list, list) and len(writes_list) > 0:
+                try:
+                    wr = await asyncio.wait_for(
+                        bacnet.write_point_multi(
+                            dev,
+                            ot,
+                            oi,
+                            writes_list,
+                            settings.request_timeout_seconds,
+                            include_readback=include_readback,
+                            readback_properties=rb_props,
+                        ),
+                        timeout=settings.request_timeout_seconds + 5.0,
+                    )
+                    data = wr
+                    if wr.get("error") and not wr.get("write_results"):
+                        status = "failed"
+                        summary = str(wr["error"])
+                        errors.append({"message": summary, "device_instance": dev})
+                    else:
+                        results = wr.get("write_results", [])
+                        ok_c = sum(1 for r in results if r.get("ok"))
+                        fail_c = len(results) - ok_c
+                        for r in results:
+                            if not r.get("ok"):
+                                errors.append(
+                                    {
+                                        "device_instance": dev,
+                                        "object_type": ot,
+                                        "object_instance": oi,
+                                        "write_index": r.get("index"),
+                                        "property": r.get("property"),
+                                        "bacnet_property": r.get("bacnet_property"),
+                                        "message": r.get("error", "write failed"),
+                                    }
+                                )
+                        if fail_c == 0:
+                            status = "success"
+                            summary = f"Write OK ({ok_c} properties)"
+                        elif ok_c == 0:
+                            status = "failed"
+                            summary = f"All {fail_c} writes failed"
+                        else:
+                            status = "partial_success"
+                            summary = f"Partial write: {ok_c} ok, {fail_c} failed"
+                    storage.append_write_audit(
+                        job.job_id,
+                        {
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                            "writes": writes_list,
+                            "outcome": status,
+                            "detail": wr,
+                        },
+                    )
+                except (ErrorRejectAbortNack, Exception) as e:
                     status = "failed"
                     summary = "Write failed"
-                    errors.append({"message": str(wr["error"])})
-                    data = wr
-                else:
-                    summary = "Write OK"
-                    data = wr
-                storage.append_write_audit(
-                    job.job_id,
-                    {
+                    data = {
                         "device_instance": dev,
                         "object_type": ot,
                         "object_instance": oi,
-                        "value": val,
-                        "priority": pri,
-                        "outcome": status,
-                        "detail": wr,
-                    },
-                )
-            except (ErrorRejectAbortNack, Exception) as e:
-                status = "failed"
-                summary = "Write failed"
-                data = {
-                    "device_instance": dev,
-                    "object_type": ot,
-                    "object_instance": oi,
-                    "property": "presentValue",
-                    "value": val,
-                    "priority": pri,
-                }
-                errors.append({"message": str(e), "traceback": traceback.format_exc()})
-                storage.append_write_audit(
-                    job.job_id,
-                    {
+                        "write_mode": "multi",
+                        "write_results": [],
+                    }
+                    errors.append({"message": str(e), "traceback": traceback.format_exc()})
+                    storage.append_write_audit(
+                        job.job_id,
+                        {
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                            "writes": writes_list,
+                            "outcome": "failed",
+                            "detail": str(e),
+                        },
+                    )
+            else:
+                val = p["value"]
+                pri: Optional[int] = None
+                if p.get("priority") is not None:
+                    pri = int(p["priority"])
+                try:
+                    wr = await asyncio.wait_for(
+                        bacnet.write_point(
+                            dev,
+                            ot,
+                            oi,
+                            val,
+                            pri,
+                            settings.request_timeout_seconds,
+                            include_readback=include_readback,
+                        ),
+                        timeout=settings.request_timeout_seconds + 5.0,
+                    )
+                    if wr.get("error"):
+                        status = "failed"
+                        summary = "Write failed"
+                        errors.append({"message": str(wr["error"])})
+                        data = wr
+                    else:
+                        summary = "Write OK"
+                        data = wr
+                    storage.append_write_audit(
+                        job.job_id,
+                        {
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                            "value": val,
+                            "priority": pri,
+                            "outcome": status,
+                            "detail": wr,
+                        },
+                    )
+                except (ErrorRejectAbortNack, Exception) as e:
+                    status = "failed"
+                    summary = "Write failed"
+                    data = {
                         "device_instance": dev,
                         "object_type": ot,
                         "object_instance": oi,
+                        "property": "presentValue",
                         "value": val,
                         "priority": pri,
-                        "outcome": "failed",
-                        "detail": str(e),
-                    },
-                )
+                    }
+                    errors.append({"message": str(e), "traceback": traceback.format_exc()})
+                    storage.append_write_audit(
+                        job.job_id,
+                        {
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                            "value": val,
+                            "priority": pri,
+                            "outcome": "failed",
+                            "detail": str(e),
+                        },
+                    )
 
         else:
             status = "failed"

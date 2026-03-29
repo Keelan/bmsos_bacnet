@@ -196,3 +196,15 @@ class BacnetClient(Protocol):
         include_readback: bool = False,
     ) -> dict[str, Any]:
         ...
+
+    async def write_point_multi(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: int,
+        writes: list[dict[str, Any]],
+        write_timeout: float,
+        include_readback: bool = False,
+        readback_properties: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        ...

@@ -6,6 +6,8 @@ SaaS ingest spec for **`snapshot_network` `data`**: [docs/saas_snapshot_ingest.m
 
 Edge **job types, payloads, and result JSON** (including `read_device_live`, enriched `read_point`, `write_point` + `include_readback`): [docs/edge_jobs_contract.md](docs/edge_jobs_contract.md).
 
+SaaS-oriented **multi-property `write_point`** and **partial_success**: [docs/saas_write_point_api.md](docs/saas_write_point_api.md).
+
 ## Quick local test (mock BACnet)
 
 ```bash

@@ -226,3 +226,76 @@ class MockBacnetClient:
             out["present_value_after"] = value
             out["read_at"] = utc_now_iso()
         return out
+
+    async def write_point_multi(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: int,
+        writes: list[dict[str, Any]],
+        write_timeout: float,
+        include_readback: bool = False,
+        readback_properties: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        if device_instance != 2001:
+            return {
+                "error": "device not found (I-Am)",
+                "device_instance": device_instance,
+                "write_results": [],
+            }
+        write_results: list[dict[str, Any]] = []
+        for i, spec in enumerate(writes):
+            if not isinstance(spec, dict) or "property" not in spec or "value" not in spec:
+                write_results.append(
+                    {
+                        "index": i,
+                        "property": spec.get("property") if isinstance(spec, dict) else None,
+                        "bacnet_property": None,
+                        "ok": False,
+                        "error": "invalid write entry",
+                    }
+                )
+                continue
+            pr = str(spec["property"])
+            bp = pr.lower().replace("_", "-")
+            # Simulate a manufacturer that rejects engineering-units writes
+            if "unit" in bp:
+                write_results.append(
+                    {
+                        "index": i,
+                        "property": pr,
+                        "bacnet_property": bp,
+                        "ok": False,
+                        "error": "optional functionality not supported (mock)",
+                    }
+                )
+            else:
+                write_results.append(
+                    {
+                        "index": i,
+                        "property": pr,
+                        "bacnet_property": bp,
+                        "ok": True,
+                    }
+                )
+        result: dict[str, Any] = {
+            "device_instance": device_instance,
+            "object_type": object_type,
+            "object_instance": object_instance,
+            "write_mode": "multi",
+            "write_results": write_results,
+        }
+        if include_readback:
+            props = readback_properties or ["present-value"]
+            rb: dict[str, Any] = {"read_at": utc_now_iso()}
+            for p in props:
+                key = p.lower().replace("-", "_")
+                if "present" in key:
+                    rb["present_value"] = 21.5
+                elif "name" in key:
+                    rb["object_name"] = "SAT"
+                else:
+                    rb[key] = None
+            result["readback"] = rb
+            result["read_at"] = rb["read_at"]
+        return result

@@ -49,6 +49,21 @@ def _object_id_string(object_type: str, object_instance: int) -> str:
     return f"{_camel_to_kebab(object_type)},{object_instance}"
 
 
+def _bacnet_property_identifier(prop: str) -> str:
+    """Normalize SaaS property names to BACnet property id (kebab-case)."""
+    p = str(prop).strip()
+    if not p:
+        return p
+    if not any(c.isupper() for c in p):
+        return p.lower().replace("_", "-")
+    return _camel_to_kebab(p)
+
+
+def _json_key_for_bacnet_property(prop_kebab: str) -> str:
+    """Stable snake_case key for readback JSON (e.g. present-value -> present_value)."""
+    return str(prop_kebab).replace("-", "_")
+
+
 async def _object_identifiers(app: Application, device_address: Address, device_identifier: ObjectIdentifier):
     try:
         object_list = await app.read_property(device_address, device_identifier, "object-list")
@@ -95,6 +110,14 @@ async def _object_identifiers(app: Application, device_address: Address, device_
 def _object_type_kind_key(object_type: str) -> str:
     """CamelCase, kebab-case, and snake_case names from BACnet stacks (e.g. multi-state-value)."""
     return str(object_type).lower().replace("-", "").replace("_", "")
+
+
+def _is_device_object_type(object_type: Any) -> bool:
+    """True for BACnet device object (object-list entry); works with str or BACpypes enum."""
+    label = getattr(object_type, "name", object_type)
+    if not isinstance(label, str):
+        label = str(label)
+    return _object_type_kind_key(label) == "device"
 
 
 def _is_binary_object_type(object_type: str) -> bool:
@@ -559,7 +582,7 @@ class BacnetPypesClient:
 
             objects: list[dict[str, Any]] = []
             for oid in oids:
-                if oid[0] == "device":
+                if _is_device_object_type(oid[0]):
                     continue
                 ot = str(oid[0])
                 oi = int(oid[1])
@@ -656,7 +679,7 @@ class BacnetPypesClient:
             )
             return empty_data, errors
 
-        non_dev = [o for o in oids if o[0] != "device"]
+        non_dev = [o for o in oids if not _is_device_object_type(o[0])]
         total_object_count = len(non_dev)
         if total_object_count == 0:
             errors.append(
@@ -839,6 +862,232 @@ class BacnetPypesClient:
                 "error": str(e),
             }
 
+    async def _resolve_device_address(
+        self, device_instance: int
+    ) -> tuple[Optional[Address], Optional[str]]:
+        app = self._require_app()
+        i_ams_fut = app.who_is(
+            device_instance, device_instance, timeout=self._settings.who_is_timeout_seconds
+        )
+        try:
+            i_ams = await asyncio.wait_for(
+                i_ams_fut,
+                timeout=self._settings.who_is_timeout_seconds + 2.0,
+            )
+        except ErrorRejectAbortNack as e:
+            return None, str(e)
+        except Exception as e:
+            return None, str(e)
+        if not i_ams:
+            return None, "device not found (I-Am)"
+        return Address(i_ams[0].pduSource), None
+
+    async def _write_property_dispatch(
+        self,
+        app: Application,
+        addr: Address,
+        ois: str,
+        pid: str,
+        val: Any,
+        write_timeout: float,
+        priority: Optional[int],
+        array_index: Optional[int],
+    ) -> Union[Any, ErrorRejectAbortNack]:
+        """Single BACnet WriteProperty; priority only for present-value; array_index for arrays."""
+        if pid == "present-value":
+            if priority is not None and array_index is not None:
+                return await asyncio.wait_for(
+                    app.write_property(
+                        addr,
+                        ois,
+                        pid,
+                        val,
+                        priority=int(priority),
+                        array_index=int(array_index),
+                    ),
+                    timeout=write_timeout,
+                )
+            if priority is not None:
+                return await asyncio.wait_for(
+                    app.write_property(
+                        addr, ois, pid, val, priority=int(priority)
+                    ),
+                    timeout=write_timeout,
+                )
+        if array_index is not None:
+            return await asyncio.wait_for(
+                app.write_property(
+                    addr, ois, pid, val, array_index=int(array_index)
+                ),
+                timeout=write_timeout,
+            )
+        return await asyncio.wait_for(
+            app.write_property(addr, ois, pid, val),
+            timeout=write_timeout,
+        )
+
+    async def write_point_multi(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: int,
+        writes: list[dict[str, Any]],
+        write_timeout: float,
+        include_readback: bool = False,
+        readback_properties: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """
+        Apply multiple WriteProperty operations in order. Per-write ok/error in write_results.
+        Manufacturers may reject some properties; use result status partial_success on SaaS.
+        """
+        addr, addr_err = await self._resolve_device_address(device_instance)
+        if addr_err:
+            return {
+                "error": addr_err,
+                "device_instance": device_instance,
+                "write_results": [],
+            }
+        app = self._require_app()
+        ois = _object_id_string(object_type, object_instance)
+        write_results: list[dict[str, Any]] = []
+
+        for i, spec in enumerate(writes):
+            if not isinstance(spec, dict):
+                write_results.append(
+                    {
+                        "index": i,
+                        "property": None,
+                        "bacnet_property": None,
+                        "ok": False,
+                        "error": "write entry must be an object",
+                    }
+                )
+                continue
+            prop_raw = spec.get("property")
+            if prop_raw is None or str(prop_raw).strip() == "":
+                write_results.append(
+                    {
+                        "index": i,
+                        "property": None,
+                        "bacnet_property": None,
+                        "ok": False,
+                        "error": "missing property",
+                    }
+                )
+                continue
+            if "value" not in spec:
+                write_results.append(
+                    {
+                        "index": i,
+                        "property": str(prop_raw),
+                        "bacnet_property": None,
+                        "ok": False,
+                        "error": "missing value (use null for BACnet null when applicable)",
+                    }
+                )
+                continue
+
+            pid = _bacnet_property_identifier(str(prop_raw))
+            if not pid:
+                write_results.append(
+                    {
+                        "index": i,
+                        "property": str(prop_raw),
+                        "bacnet_property": None,
+                        "ok": False,
+                        "error": "empty property id",
+                    }
+                )
+                continue
+
+            val = spec["value"]
+            pri = spec.get("priority")
+            if pri is not None:
+                pri = int(pri)
+            arr_idx = spec.get("array_index")
+            if arr_idx is not None:
+                arr_idx = int(arr_idx)
+
+            try:
+                resp = await self._write_property_dispatch(
+                    app, addr, ois, pid, val, write_timeout, pri, arr_idx
+                )
+                if isinstance(resp, ErrorRejectAbortNack):
+                    write_results.append(
+                        {
+                            "index": i,
+                            "property": str(prop_raw),
+                            "bacnet_property": pid,
+                            "ok": False,
+                            "error": str(resp),
+                        }
+                    )
+                else:
+                    write_results.append(
+                        {
+                            "index": i,
+                            "property": str(prop_raw),
+                            "bacnet_property": pid,
+                            "ok": True,
+                        }
+                    )
+            except ErrorRejectAbortNack as err:
+                write_results.append(
+                    {
+                        "index": i,
+                        "property": str(prop_raw),
+                        "bacnet_property": pid,
+                        "ok": False,
+                        "error": str(err),
+                    }
+                )
+            except Exception as e:
+                write_results.append(
+                    {
+                        "index": i,
+                        "property": str(prop_raw),
+                        "bacnet_property": pid,
+                        "ok": False,
+                        "error": str(e),
+                    }
+                )
+
+        result: dict[str, Any] = {
+            "device_instance": device_instance,
+            "object_type": object_type,
+            "object_instance": object_instance,
+            "write_mode": "multi",
+            "write_results": write_results,
+        }
+
+        props_to_read: Optional[list[str]] = None
+        if include_readback:
+            props_to_read = readback_properties if readback_properties else ["present-value"]
+
+        if props_to_read:
+            rb_at = utc_now_iso()
+            rb_obj: dict[str, Any] = {}
+            for rb in props_to_read:
+                rpid = _bacnet_property_identifier(str(rb))
+                jkey = _json_key_for_bacnet_property(rpid)
+                try:
+                    pv = await asyncio.wait_for(
+                        app.read_property(addr, ois, rpid),
+                        timeout=write_timeout,
+                    )
+                    if isinstance(pv, ErrorRejectAbortNack):
+                        rb_obj[jkey] = None
+                        rb_obj[f"{jkey}_error"] = str(pv)
+                    else:
+                        rb_obj[jkey] = to_json_safe(pv)
+                except (ErrorRejectAbortNack, Exception) as e:
+                    rb_obj[jkey] = None
+                    rb_obj[f"{jkey}_error"] = str(e)
+            result["readback"] = rb_obj
+            result["read_at"] = rb_at
+
+        return result
+
     async def write_point(
         self,
         device_instance: int,
@@ -849,25 +1098,21 @@ class BacnetPypesClient:
         write_timeout: float,
         include_readback: bool = False,
     ) -> dict[str, Any]:
+        addr, addr_err = await self._resolve_device_address(device_instance)
+        if addr_err:
+            return {"error": addr_err}
         app = self._require_app()
-        i_ams_fut = app.who_is(device_instance, device_instance, timeout=self._settings.who_is_timeout_seconds)
-        try:
-            i_ams = await asyncio.wait_for(
-                i_ams_fut,
-                timeout=self._settings.who_is_timeout_seconds + 2.0,
-            )
-        except ErrorRejectAbortNack as e:
-            return {"error": str(e)}
-        except Exception as e:
-            return {"error": str(e)}
-        if not i_ams:
-            return {"error": "device not found (I-Am)"}
-        addr = Address(i_ams[0].pduSource)
         ois = _object_id_string(object_type, object_instance)
         try:
-            resp = await asyncio.wait_for(
-                app.write_property(addr, ois, "present-value", value, priority=priority),
-                timeout=write_timeout,
+            resp = await self._write_property_dispatch(
+                app,
+                addr,
+                ois,
+                "present-value",
+                value,
+                write_timeout,
+                priority,
+                None,
             )
             if isinstance(resp, ErrorRejectAbortNack):
                 return {
