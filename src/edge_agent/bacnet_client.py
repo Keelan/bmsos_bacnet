@@ -86,19 +86,24 @@ class BacnetPypesClient:
         self._app: Optional[Application] = None
 
     def _build_application(self) -> Application:
-        os.environ["BACPYPES_DEVICE_INSTANCE"] = str(self._effective.device_instance)
-        os.environ["BACPYPES_VENDOR_IDENTIFIER"] = "999"
-        if self._effective.bind_ip:
-            os.environ["BACPYPES_DEVICE_ADDRESS"] = format_bacpypes_device_address(
+        # BACpypes3 snapshots BACPYPES_* from os.environ when bacpypes3.argparse is
+        # imported; later os.environ changes are NOT used as argparse defaults.
+        # Always pass bind/instance/vendor on the CLI so .env values apply.
+        parser = SimpleArgumentParser()
+        cli = [
+            "--instance",
+            str(self._effective.device_instance),
+            "--vendoridentifier",
+            "999",
+        ]
+        if self._effective.bind_ip.strip():
+            addr = format_bacpypes_device_address(
                 self._effective.bind_ip,
                 self._settings.bacnet_bind_prefix,
                 self._effective.udp_port,
             )
-        elif "BACPYPES_DEVICE_ADDRESS" in os.environ:
-            del os.environ["BACPYPES_DEVICE_ADDRESS"]
-
-        parser = SimpleArgumentParser()
-        args = parser.parse_args([])
+            cli.extend(["--address", addr])
+        args = parser.parse_args(cli)
         app = Application.from_args(args)
         return app
 
@@ -106,7 +111,20 @@ class BacnetPypesClient:
         if self._app is not None:
             return
         self._app = self._build_application()
-        _log.info("bacnet_stack_started device_instance=%s", self._effective.device_instance)
+        addr_log = (
+            format_bacpypes_device_address(
+                self._effective.bind_ip,
+                self._settings.bacnet_bind_prefix,
+                self._effective.udp_port,
+            )
+            if self._effective.bind_ip.strip()
+            else "(default host)"
+        )
+        _log.info(
+            "bacnet_stack_started device_instance=%s address=%s",
+            self._effective.device_instance,
+            addr_log,
+        )
 
     async def stop(self) -> None:
         if self._app is not None:

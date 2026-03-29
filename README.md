@@ -54,7 +54,7 @@ python -m edge_agent
 
 Or with systemd: `sudo systemctl restart edge-agent` after `git pull` + `pip install -e .`.
 
-You no longer need to export **`BACPYPES_DEVICE_ADDRESS`** manually; the agent sets **`ip/prefix:port`** from `.env`.
+The agent passes **`--address ip/prefix:port`** into BACpypes (not only `os.environ`): BACpypes3 reads `BACPYPES_DEVICE_ADDRESS` **once at import**, so runtime env updates were ignored and Who-Is failed with **`no broadcast`**.
 
 ## systemd
 

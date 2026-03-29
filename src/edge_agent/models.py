@@ -44,7 +44,8 @@ def merge_bacnet(
         return eff
     if remote.device_instance is not None:
         eff.device_instance = remote.device_instance
-    if remote.bind_ip is not None:
+    # Empty string from API must not wipe .env bind_ip (common JSON default).
+    if remote.bind_ip is not None and remote.bind_ip.strip():
         eff.bind_ip = remote.bind_ip
     if remote.udp_port is not None:
         eff.udp_port = remote.udp_port
