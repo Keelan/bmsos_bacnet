@@ -23,6 +23,9 @@ class SaasClient:
             headers={
                 "Authorization": f"Bearer {settings.api_token}",
                 "Content-Type": "application/json",
+                # Laravel often 302s to login for unauthenticated *web* requests; JSON APIs
+                # should return 401 instead when this header is present.
+                "Accept": "application/json",
             },
             timeout=httpx.Timeout(settings.request_timeout_seconds),
         )
@@ -35,6 +38,13 @@ class SaasClient:
         for attempt in range(self._settings.saas_max_retries):
             try:
                 r = await self._client.post(path, json=body)
+                if r.status_code in (301, 302, 303, 307, 308):
+                    loc = r.headers.get("location", "")
+                    raise httpx.HTTPStatusError(
+                        f"redirect {r.status_code} to {loc!r} (check API route + Accept: application/json + auth)",
+                        request=r.request,
+                        response=r,
+                    )
                 if r.status_code >= 500:
                     raise httpx.HTTPStatusError("server error", request=r.request, response=r)
                 r.raise_for_status()

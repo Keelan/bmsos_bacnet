@@ -1,0 +1,35 @@
+"""Convert BACnet / BACpypes values into JSON-serializable plain Python."""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+def to_json_safe(obj: Any) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, int):
+        return int(obj)
+    if isinstance(obj, float):
+        return float(obj)
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, (bytes, bytearray)):
+        return bytes(obj).hex()
+    if isinstance(obj, dict):
+        return {str(k): to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        if type(obj).__name__ == "ObjectIdentifier" and len(obj) == 2:
+            return [str(obj[0]), int(obj[1])]
+        return [to_json_safe(x) for x in obj]
+    try:
+        return int(obj)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(obj)
+    except (TypeError, ValueError):
+        pass
+    return str(obj)

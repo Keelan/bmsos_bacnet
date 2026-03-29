@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from bacpypes3.apdu import ErrorRejectAbortNack
 
+from edge_agent.json_safe import to_json_safe
 from edge_agent.models import (
     BacnetClient,
     JobModel,
@@ -40,8 +41,8 @@ async def run_job(
                 timeout=settings.who_is_timeout_seconds + 5.0,
             )
             errors.extend(derr)
-            storage.save_latest_discovery({"discovered_at": utc_now_iso(), "devices": devices})
-            data = {"discovered_at": utc_now_iso(), "devices": devices}
+            data = to_json_safe({"discovered_at": utc_now_iso(), "devices": devices})
+            storage.save_latest_discovery(data)
             summary = f"Discovered {len(devices)} devices"
             if errors and devices:
                 status = "partial_success"
@@ -57,6 +58,7 @@ async def run_job(
                 timeout=600.0,
             )
             errors.extend(serr)
+            snap = to_json_safe(snap)
             storage.save_latest_snapshot(snap)
             data = snap
             nd = len(snap.get("devices", []))
@@ -172,6 +174,7 @@ async def run_job(
         _log.exception("job_failed job_id=%s", job.job_id)
 
     finished = utc_now_iso()
+    data = to_json_safe(data)
     return JobResultEnvelope(
         job_id=job.job_id,
         status=status,  # type: ignore[arg-type]
