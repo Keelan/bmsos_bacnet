@@ -75,17 +75,29 @@ async def _apply_remote_config(
     settings: Settings,
     storage: Storage,
     bacnet: Union[MockBacnetClient, BacnetPypesClient],
-    cfg,
+    cfg: ConfigPullResponse,
 ) -> None:
     if cfg.unchanged or cfg.revision is None:
         return
-    bacnet_payload: dict = {}
+    existing = storage.get_stored_remote_config_dict() or {}
+
     if cfg.bacnet is not None:
         bacnet_payload = cfg.bacnet.model_dump(exclude_none=True)
+    else:
+        prev_b = existing.get("bacnet")
+        bacnet_payload = dict(prev_b) if isinstance(prev_b, dict) else {}
+
+    if cfg.agent is not None:
+        agent_payload = cfg.agent.model_dump(exclude_none=True)
+    else:
+        prev_a = existing.get("agent")
+        agent_payload = dict(prev_a) if isinstance(prev_a, dict) else {}
+
     storage.save_remote_config(
         cfg.revision,
         cfg.updated_at or utc_now_iso(),
         bacnet_payload,
+        agent_payload,
     )
     if isinstance(bacnet, BacnetPypesClient):
         eff = _load_effective(settings, storage)
@@ -114,12 +126,28 @@ async def _run_forever(settings: Settings) -> None:
 
     async def heartbeat_task() -> None:
         while True:
-            await asyncio.sleep(settings.heartbeat_interval_seconds)
+            await asyncio.sleep(
+                apply_float_tuning(
+                    settings.heartbeat_interval_seconds,
+                    storage.get_remote_agent_tuning(),
+                    "heartbeat_interval_seconds",
+                    10.0,
+                    600.0,
+                )
+            )
             await saas.heartbeat(await _heartbeat_body(settings, storage))
 
     async def config_task() -> None:
         while True:
-            await asyncio.sleep(settings.config_poll_interval_seconds)
+            await asyncio.sleep(
+                apply_float_tuning(
+                    settings.config_poll_interval_seconds,
+                    storage.get_remote_agent_tuning(),
+                    "config_poll_interval_seconds",
+                    15.0,
+                    3600.0,
+                )
+            )
             async with job_lock:
                 rev, _ = storage.get_remote_config_state()
                 cfg = await saas.fetch_config(rev)
@@ -130,7 +158,15 @@ async def _run_forever(settings: Settings) -> None:
 
     async def job_task() -> None:
         while True:
-            await asyncio.sleep(settings.poll_interval_seconds)
+            await asyncio.sleep(
+                apply_float_tuning(
+                    settings.poll_interval_seconds,
+                    storage.get_remote_agent_tuning(),
+                    "poll_interval_seconds",
+                    1.0,
+                    120.0,
+                )
+            )
             async with job_lock:
                 nj = await saas.next_job()
                 job = nj.job

@@ -1,4 +1,6 @@
 .env
+# Local / agent reference docs — not versioned
+docs/
 .venv/
 __pycache__/
 *.py[cod]

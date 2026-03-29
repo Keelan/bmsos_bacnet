@@ -31,7 +31,11 @@ _config: dict[str, Any] = {
         "device_instance": 59999,
         "bind_ip": "",
         "udp_port": 47808,
+        "device_name": "fake-edge",
+        "bind_prefix": 24,
+        "vendor_identifier": 999,
     },
+    "agent": {},
 }
 _job_queue: deque[dict[str, Any]] = deque()
 
@@ -81,11 +85,14 @@ def pull_config(
     _auth(authorization)
     if body.config_revision == _config["revision"]:
         return {"unchanged": True, "revision": _config["revision"]}
-    return {
+    out: dict[str, Any] = {
         "revision": _config["revision"],
         "updated_at": _config["updated_at"],
         "bacnet": _config["bacnet"],
     }
+    if "agent" in _config:
+        out["agent"] = _config["agent"]
+    return out
 
 
 @app.post("/api/edge/v1/jobs/next")
