@@ -470,9 +470,18 @@ async def _read_priority_array_for_snapshot(
     return slots
 
 
-def _bacnet_null_priority_value() -> Any:
-    """BACnet relinquish at a priority slot requires PriorityValue(null), not Python None."""
-    # Match BACpypes3 PriorityArray _prototype; positional Null(()) can raise TypeError in Choice init.
+def _bacnet_relinquish_present_value_as_null() -> Any:
+    """
+    WriteProperty to present-value with priority: BACnet NULL relinquishes that slot.
+    BACpypes3 write_property skips coercion only for primitivedata.Null when priority is set.
+    """
+    from bacpypes3.primitivedata import Null
+
+    return Null(())
+
+
+def _bacnet_null_priority_array_element() -> Any:
+    """priority-array[index] relinquish — element type is PriorityValue."""
     from bacpypes3.basetypes import PriorityValue
 
     return PriorityValue(null=())
@@ -487,9 +496,9 @@ def _normalize_write_value_for_bacnet(
     if val is not None:
         return val
     if pid == "priority-array" and array_index is not None:
-        return _bacnet_null_priority_value()
+        return _bacnet_null_priority_array_element()
     if pid == "present-value" and priority is not None:
-        return _bacnet_null_priority_value()
+        return _bacnet_relinquish_present_value_as_null()
     return val
 
 
