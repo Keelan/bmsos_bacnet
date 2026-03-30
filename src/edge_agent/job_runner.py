@@ -29,7 +29,7 @@ def _sanitize_job_result_messages(data: Any, errors: list[dict[str, Any]]) -> No
     """Force non-empty strings so JSON never carries null error/message (SaaS/UI)."""
     if isinstance(data, dict):
         for row in data.get("write_results") or []:
-            if isinstance(row, dict) and row.get("ok") is False:
+            if isinstance(row, dict) and row.get("ok") is not True:
                 row["error"] = failure_message(
                     row.get("error"),
                     default=f"write failed (index {row.get('index')})",

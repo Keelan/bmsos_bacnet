@@ -393,6 +393,26 @@ async def _snap_read_property(
     return val
 
 
+def _priority_array_whole_has_live_slot(whole: Any) -> bool:
+    """
+    True if at least one priority slot decodes to a non-null JSON value.
+    Some devices return a 'successful' full-array read of 16 empty slots while
+    indexed reads 1..16 return the real PriorityValues (see priority-array reads).
+    """
+    try:
+        n = len(whole)  # type: ignore[arg-type]
+    except TypeError:
+        return True
+    for i in range(min(n, 16)):
+        try:
+            slot = whole[i]
+        except (IndexError, TypeError):
+            return True
+        if to_json_safe(slot) is not None:
+            return True
+    return False
+
+
 def _priority_array_whole_is_usable(whole: Any) -> bool:
     if whole is None:
         return False
@@ -400,7 +420,12 @@ def _priority_array_whole_is_usable(whole: Any) -> bool:
         n = len(whole)
     except TypeError:
         return False
-    return n == 16
+    if n != 16:
+        return False
+    # Bulk read may succeed with 16 empty-looking slots; prefer indexed fallback.
+    if not _priority_array_whole_has_live_slot(whole):
+        return False
+    return True
 
 
 async def _read_priority_array_for_snapshot(
@@ -1446,7 +1471,7 @@ class BacnetPypesClient:
                 )
 
         for row in write_results:
-            if row.get("ok"):
+            if row.get("ok") is True:
                 continue
             row["error"] = failure_message(
                 row.get("error"),
