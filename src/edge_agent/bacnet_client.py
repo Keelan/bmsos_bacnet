@@ -185,7 +185,12 @@ def _snapshot_property_plan(object_type: str) -> tuple[list[tuple[str, str]], bo
             "characterstringvalue",
         ):
             row.append(rd)
-        if k in ("binaryoutput", "binaryvalue"):
+        if k in (
+            "binaryoutput",
+            "binaryvalue",
+            "multistateoutput",
+            "multistatevalue",
+        ):
             row.append(pa)
         return row, True
     if k == "loop":
