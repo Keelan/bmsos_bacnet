@@ -472,10 +472,10 @@ async def _read_priority_array_for_snapshot(
 
 def _bacnet_null_priority_value() -> Any:
     """BACnet relinquish at a priority slot requires PriorityValue(null), not Python None."""
+    # Match BACpypes3 PriorityArray _prototype; positional Null(()) can raise TypeError in Choice init.
     from bacpypes3.basetypes import PriorityValue
-    from bacpypes3.primitivedata import Null
 
-    return PriorityValue(Null(()))
+    return PriorityValue(null=())
 
 
 def _normalize_write_value_for_bacnet(
