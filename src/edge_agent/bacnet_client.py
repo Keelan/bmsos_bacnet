@@ -1472,17 +1472,38 @@ class BacnetPypesClient:
                 rpid = _bacnet_property_identifier(str(rb))
                 jkey = _json_key_for_bacnet_property(rpid)
                 try:
-                    pv = await asyncio.wait_for(
-                        app.read_property(addr, ois, rpid),
-                        timeout=write_timeout,
-                    )
-                    if isinstance(pv, ErrorRejectAbortNack):
-                        rb_obj[jkey] = None
-                        rb_obj[f"{jkey}_error"] = failure_message(
-                            pv, default="readback rejected"
+                    if rpid == "priority-array":
+                        pe: list[dict[str, Any]] = []
+                        pa_list = await asyncio.wait_for(
+                            _read_priority_array_for_snapshot(
+                                app,
+                                addr,
+                                ois,
+                                write_timeout,
+                                pe,
+                                {
+                                    "device_instance": device_instance,
+                                    "object_type": object_type,
+                                    "object_instance": object_instance,
+                                },
+                            ),
+                            timeout=write_timeout + 2.0,
                         )
+                        rb_obj[jkey] = to_json_safe(pa_list)
+                        if pe:
+                            rb_obj[f"{jkey}_errors"] = pe
                     else:
-                        rb_obj[jkey] = to_json_safe(pv)
+                        pv = await asyncio.wait_for(
+                            app.read_property(addr, ois, rpid),
+                            timeout=write_timeout,
+                        )
+                        if isinstance(pv, ErrorRejectAbortNack):
+                            rb_obj[jkey] = None
+                            rb_obj[f"{jkey}_error"] = failure_message(
+                                pv, default="readback rejected"
+                            )
+                        else:
+                            rb_obj[jkey] = to_json_safe(pv)
                 except (ErrorRejectAbortNack, Exception) as e:
                     rb_obj[jkey] = None
                     rb_obj[f"{jkey}_error"] = failure_message(

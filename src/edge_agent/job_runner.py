@@ -25,6 +25,23 @@ from edge_agent.storage import Storage
 _log = logging.getLogger(__name__)
 
 
+def _sanitize_job_result_messages(data: Any, errors: list[dict[str, Any]]) -> None:
+    """Force non-empty strings so JSON never carries null error/message (SaaS/UI)."""
+    if isinstance(data, dict):
+        for row in data.get("write_results") or []:
+            if isinstance(row, dict) and row.get("ok") is False:
+                row["error"] = failure_message(
+                    row.get("error"),
+                    default=f"write failed (index {row.get('index')})",
+                )
+    for err in errors:
+        if isinstance(err, dict) and "message" in err:
+            err["message"] = failure_message(
+                err.get("message"),
+                default="error (no message text)",
+            )
+
+
 async def run_job(
     job: JobModel,
     bacnet: BacnetClient,
@@ -441,6 +458,7 @@ async def run_job(
         _log.exception("job_failed job_id=%s", job.job_id)
 
     finished = utc_now_iso()
+    _sanitize_job_result_messages(data, errors)
     data = to_json_safe(data)
     return JobResultEnvelope(
         job_id=job.job_id,
