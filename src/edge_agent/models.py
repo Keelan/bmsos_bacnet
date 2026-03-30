@@ -182,6 +182,7 @@ class BacnetClient(Protocol):
         object_instance: int,
         prop: str,
         read_timeout: float,
+        array_index: Optional[int] = None,
     ) -> dict[str, Any]:
         ...
 

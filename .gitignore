@@ -1,4 +1,6 @@
 .env
+# Local / site-specific installer — not versioned
+deploy/install-edge-agent.sh
 # Local / agent reference docs — not versioned
 docs/
 .venv/

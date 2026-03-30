@@ -121,6 +121,7 @@ class MockBacnetClient:
                 "status_flags": None,
                 "out_of_service": False,
                 "reliability": "noFaultDetected",
+                "relinquish_default": 18.0,
             },
             {
                 "object_type": "binaryValue",
@@ -135,6 +136,7 @@ class MockBacnetClient:
                 "status_flags": None,
                 "out_of_service": False,
                 "reliability": "noFaultDetected",
+                "relinquish_default": "inactive",
             },
             {
                 "object_type": "multiStateValue",
@@ -149,6 +151,7 @@ class MockBacnetClient:
                 "status_flags": None,
                 "out_of_service": False,
                 "reliability": "noFaultDetected",
+                "relinquish_default": 1,
             },
         ]
         total = len(objects)
@@ -174,9 +177,10 @@ class MockBacnetClient:
         object_instance: int,
         prop: str,
         read_timeout: float,
+        array_index: Optional[int] = None,
     ) -> dict[str, Any]:
         pl = prop.replace("present-value", "presentValue").lower()
-        if pl == "presentvalue":
+        if pl == "presentvalue" and array_index is None:
             return {
                 "object_type": object_type,
                 "object_instance": object_instance,
@@ -194,11 +198,37 @@ class MockBacnetClient:
                 "datatype": "float",
                 "read_at": utc_now_iso(),
             }
+        pa = pl.replace("_", "").replace("-", "")
+        if pa == "priorityarray":
+            pid = "priority-array"
+            if array_index is not None:
+                return {
+                    "device_instance": device_instance,
+                    "object_type": object_type,
+                    "object_instance": object_instance,
+                    "property": prop,
+                    "bacnet_property": pid,
+                    "array_index": int(array_index),
+                    "value": 21.0,
+                    "datatype": "float",
+                    "read_at": utc_now_iso(),
+                }
+            return {
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "object_instance": object_instance,
+                "property": prop,
+                "bacnet_property": pid,
+                "value": [None] * 16,
+                "datatype": "list",
+                "read_at": utc_now_iso(),
+            }
         return {
             "device_instance": device_instance,
             "object_type": object_type,
             "object_instance": object_instance,
             "property": prop,
+            "array_index": array_index,
             "value": None,
             "datatype": "NoneType",
             "read_at": utc_now_iso(),

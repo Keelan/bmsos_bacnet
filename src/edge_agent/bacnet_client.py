@@ -162,18 +162,32 @@ def _snapshot_property_plan(object_type: str) -> tuple[list[tuple[str, str]], bo
         ("out-of-service", "out_of_service"),
     ]
     rel: tuple[str, str] = ("reliability", "reliability")
+    # Objects with Priority_Array normally expose Relinquish_Default (not analog/binary inputs).
+    rd: tuple[str, str] = ("relinquish-default", "relinquish_default")
+    pa: tuple[str, str] = ("priority-array", "priority_array")
     if k == "calendar":
         return base + [("present-value", "present_value")], False
     if k in ("analoginput", "analogoutput"):
-        return base + [("units", "units")] + tail_pv + [rel], False
+        ao = base + [("units", "units")] + tail_pv + [rel]
+        if k == "analogoutput":
+            ao.append(rd)
+            ao.append(pa)
+        return ao, False
     if k == "analogvalue":
-        return base + [("units", "units")] + tail_pv, True
-    if (
-        k.startswith("binary")
-        or k.startswith("multistate")
-        or k == "characterstringvalue"
-    ):
-        return base + tail_pv, True
+        return base + [("units", "units")] + tail_pv + [rd, pa], True
+    if k.startswith("binary") or k.startswith("multistate") or k == "characterstringvalue":
+        row = base + list(tail_pv)
+        if k in (
+            "binaryoutput",
+            "binaryvalue",
+            "multistateoutput",
+            "multistatevalue",
+            "characterstringvalue",
+        ):
+            row.append(rd)
+        if k in ("binaryoutput", "binaryvalue"):
+            row.append(pa)
+        return row, True
     if k == "loop":
         return base + tail_pv, True
     return base + tail_pv, True
@@ -731,8 +745,12 @@ class BacnetPypesClient:
         object_instance: int,
         prop: str,
         read_timeout: float,
+        array_index: Optional[int] = None,
     ) -> dict[str, Any]:
         app = self._require_app()
+        arr_idx: Optional[int] = (
+            int(array_index) if array_index is not None else None
+        )
         i_ams_fut = app.who_is(device_instance, device_instance, timeout=self._settings.who_is_timeout_seconds)
         try:
             i_ams = await asyncio.wait_for(
@@ -745,6 +763,7 @@ class BacnetPypesClient:
                 "object_type": object_type,
                 "object_instance": object_instance,
                 "property": prop,
+                "array_index": arr_idx,
                 "error": str(e),
             }
         except Exception as e:
@@ -753,6 +772,7 @@ class BacnetPypesClient:
                 "object_type": object_type,
                 "object_instance": object_instance,
                 "property": prop,
+                "array_index": arr_idx,
                 "error": str(e),
             }
         if not i_ams:
@@ -761,13 +781,13 @@ class BacnetPypesClient:
                 "object_type": object_type,
                 "object_instance": object_instance,
                 "property": prop,
+                "array_index": arr_idx,
                 "error": "device not found (I-Am)",
             }
         addr = Address(i_ams[0].pduSource)
         ois = _object_id_string(object_type, object_instance)
-        prop_s = prop.replace("presentValue", "present-value")
 
-        if _is_present_value_property(prop):
+        if _is_present_value_property(prop) and arr_idx is None:
             try:
                 val = await asyncio.wait_for(
                     app.read_property(addr, ois, "present-value"),
@@ -823,34 +843,65 @@ class BacnetPypesClient:
                 out["_property_errors"] = enrich_errors
             return out
 
+        pid = (
+            "present-value"
+            if _is_present_value_property(prop)
+            else _bacnet_property_identifier(str(prop))
+        )
+        if not pid:
+            return {
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "object_instance": object_instance,
+                "property": prop,
+                "array_index": arr_idx,
+                "error": "empty property id",
+            }
         try:
-            val = await asyncio.wait_for(
-                app.read_property(addr, ois, prop_s),
-                timeout=read_timeout,
-            )
+            if arr_idx is not None:
+                val = await asyncio.wait_for(
+                    app.read_property(
+                        addr, ois, pid, array_index=int(arr_idx)
+                    ),
+                    timeout=read_timeout,
+                )
+            else:
+                val = await asyncio.wait_for(
+                    app.read_property(addr, ois, pid),
+                    timeout=read_timeout,
+                )
             if isinstance(val, ErrorRejectAbortNack):
                 return {
                     "device_instance": device_instance,
                     "object_type": object_type,
                     "object_instance": object_instance,
                     "property": prop,
+                    "bacnet_property": pid,
+                    "array_index": arr_idx,
                     "error": str(val),
                 }
-            return {
+            safe = to_json_safe(val)
+            out: dict[str, Any] = {
                 "device_instance": device_instance,
                 "object_type": object_type,
                 "object_instance": object_instance,
                 "property": prop,
-                "value": val,
+                "bacnet_property": pid,
+                "value": safe,
                 "datatype": type(val).__name__,
                 "read_at": utc_now_iso(),
             }
+            if arr_idx is not None:
+                out["array_index"] = arr_idx
+            return out
         except ErrorRejectAbortNack as err:
             return {
                 "device_instance": device_instance,
                 "object_type": object_type,
                 "object_instance": object_instance,
                 "property": prop,
+                "bacnet_property": pid,
+                "array_index": arr_idx,
                 "error": str(err),
             }
         except Exception as e:
@@ -859,6 +910,8 @@ class BacnetPypesClient:
                 "object_type": object_type,
                 "object_instance": object_instance,
                 "property": prop,
+                "bacnet_property": pid,
+                "array_index": arr_idx,
                 "error": str(e),
             }
 
@@ -895,6 +948,12 @@ class BacnetPypesClient:
     ) -> Union[Any, ErrorRejectAbortNack]:
         """Single BACnet WriteProperty; priority only for present-value; array_index for arrays."""
         if pid == "present-value":
+            if array_index is not None and priority is None:
+                raise ValueError(
+                    "present-value uses BACnet priority (1-16), not array_index; "
+                    "omit array_index, set priority for that slot, or use property "
+                    "priority-array with array_index"
+                )
             if priority is not None and array_index is not None:
                 return await asyncio.wait_for(
                     app.write_property(
@@ -1007,6 +1066,59 @@ class BacnetPypesClient:
             arr_idx = spec.get("array_index")
             if arr_idx is not None:
                 arr_idx = int(arr_idx)
+
+            if pid == "present-value":
+                if val is None and pri is None:
+                    write_results.append(
+                        {
+                            "index": i,
+                            "property": str(prop_raw),
+                            "bacnet_property": pid,
+                            "ok": False,
+                            "error": (
+                                "present-value null (relinquish) requires priority 1-16, "
+                                "or use property priority-array with array_index and value null"
+                            ),
+                        }
+                    )
+                    continue
+                if pri is not None and (pri < 1 or pri > 16):
+                    write_results.append(
+                        {
+                            "index": i,
+                            "property": str(prop_raw),
+                            "bacnet_property": pid,
+                            "ok": False,
+                            "error": "priority must be 1-16 for present-value",
+                        }
+                    )
+                    continue
+            if pid == "priority-array" and arr_idx is None:
+                write_results.append(
+                    {
+                        "index": i,
+                        "property": str(prop_raw),
+                        "bacnet_property": pid,
+                        "ok": False,
+                        "error": "priority-array write requires array_index (1-16)",
+                    }
+                )
+                continue
+            if (
+                pid == "priority-array"
+                and arr_idx is not None
+                and (arr_idx < 1 or arr_idx > 16)
+            ):
+                write_results.append(
+                    {
+                        "index": i,
+                        "property": str(prop_raw),
+                        "bacnet_property": pid,
+                        "ok": False,
+                        "error": "priority-array array_index must be 1-16",
+                    }
+                )
+                continue
 
             try:
                 resp = await self._write_property_dispatch(
