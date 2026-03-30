@@ -43,10 +43,66 @@ def _camel_to_kebab(name: str) -> str:
     return re.sub("([a-z0-9])([A-Z])", r"\1-\2", s1).lower()
 
 
+# Plain normalized type (no separators) -> BACnet object-id token for ReadProperty.
+# Without this, "binaryvalue" becomes "binaryvalue,1" and stacks often reject it;
+# "binary-value,1" works. Same for analog-value, multi-state-value, etc.
+_PLAIN_KIND_TO_OBJECT_ID_TOKEN: dict[str, str] = {
+    "analoginput": "analog-input",
+    "analogoutput": "analog-output",
+    "analogvalue": "analog-value",
+    "binaryinput": "binary-input",
+    "binaryoutput": "binary-output",
+    "binaryvalue": "binary-value",
+    "multistateinput": "multi-state-input",
+    "multistateoutput": "multi-state-output",
+    "multistatevalue": "multi-state-value",
+    "characterstringvalue": "character-string-value",
+    "notificationclass": "notification-class",
+    "trendlog": "trend-log",
+    "trendlogmultiple": "trend-log-multiple",
+    "eventenrollment": "event-enrollment",
+}
+
+
+def _object_type_label(raw: Any) -> str:
+    """
+    Stable BACnet object-type label for planning reads and JSON rows.
+    Handles BACpypes enums (use .name), 'ObjectType.analogValue' str forms, etc.
+    """
+    if raw is None:
+        return ""
+    name = getattr(raw, "name", None)
+    if isinstance(name, str) and name.strip():
+        base = name.strip()
+    else:
+        base = str(raw).strip()
+    if "." in base:
+        base = base.rsplit(".", 1)[-1]
+    return base
+
+
+def _object_type_kind_key(object_type: Any) -> str:
+    """Normalize for _snapshot_property_plan (camel, kebab, snake, spaces)."""
+    label = _object_type_label(object_type)
+    return label.lower().replace("-", "").replace("_", "").replace(" ", "")
+
+
 def _object_id_string(object_type: str, object_instance: int) -> str:
     # BACpypes3 ObjectIdentifier string parsing requires "type,instance" or "type:instance"
     # (a space separator is rejected and breaks every read_property on objects).
-    return f"{_camel_to_kebab(object_type)},{object_instance}"
+    p = str(object_type).strip()
+    pk = _object_type_kind_key(p)
+    if pk in _PLAIN_KIND_TO_OBJECT_ID_TOKEN:
+        p = _PLAIN_KIND_TO_OBJECT_ID_TOKEN[pk]
+    return f"{_camel_to_kebab(p)},{object_instance}"
+
+
+def _object_type_for_json(ot_label: str) -> str:
+    """Kebab-case object_type for API consumers (matches Explorer / SaaS)."""
+    pk = _object_type_kind_key(ot_label)
+    if pk in _PLAIN_KIND_TO_OBJECT_ID_TOKEN:
+        return _PLAIN_KIND_TO_OBJECT_ID_TOKEN[pk]
+    return _camel_to_kebab(ot_label)
 
 
 def _bacnet_property_identifier(prop: str) -> str:
@@ -107,11 +163,6 @@ async def _object_identifiers(app: Application, device_address: Address, device_
     return object_list
 
 
-def _object_type_kind_key(object_type: str) -> str:
-    """CamelCase, kebab-case, and snake_case names from BACnet stacks (e.g. multi-state-value)."""
-    return str(object_type).lower().replace("-", "").replace("_", "")
-
-
 def _is_device_object_type(object_type: Any) -> bool:
     """True for BACnet device object (object-list entry); works with str or BACpypes enum."""
     label = getattr(object_type, "name", object_type)
@@ -120,15 +171,15 @@ def _is_device_object_type(object_type: Any) -> bool:
     return _object_type_kind_key(label) == "device"
 
 
-def _is_binary_object_type(object_type: str) -> bool:
+def _is_binary_object_type(object_type: Any) -> bool:
     return _object_type_kind_key(object_type).startswith("binary")
 
 
-def _is_multistate_object_type(object_type: str) -> bool:
+def _is_multistate_object_type(object_type: Any) -> bool:
     return _object_type_kind_key(object_type).startswith("multistate")
 
 
-def _snapshot_property_plan(object_type: str) -> tuple[list[tuple[str, str]], bool]:
+def _snapshot_property_plan(object_type: Any) -> tuple[list[tuple[str, str]], bool]:
     """
     BACnet properties to read per object type (property id, JSON key).
     The bool is True when we should try an extra optional (silent) reliability read
@@ -495,24 +546,26 @@ async def _build_snapshot_style_object_entry(
     app: Application,
     addr: Address,
     device_instance: int,
-    object_type: str,
+    object_type: Any,
     object_instance: int,
     read_timeout: float,
     errors: list[dict[str, Any]],
     *,
+    read_oid: Optional[Any] = None,
     present_value_precooked: Optional[Any] = None,
 ) -> dict[str, Any]:
     """One BACnet object's snapshot-shaped row (same keys as snapshot_network objects[])."""
-    ot = str(object_type)
+    ot = _object_type_label(object_type)
     oi = int(object_instance)
-    oid = _object_id_string(ot, oi)
+    oid = read_oid if read_oid is not None else _object_id_string(ot, oi)
+    ot_json = _object_type_for_json(ot)
     err_obj: dict[str, Any] = {
         "device_instance": device_instance,
-        "object_type": ot,
+        "object_type": ot_json,
         "object_instance": oi,
     }
     entry: dict[str, Any] = {
-        "object_type": ot,
+        "object_type": ot_json,
         "object_instance": oi,
     }
     plan, try_optional_reliability = _snapshot_property_plan(ot)
@@ -767,10 +820,16 @@ class BacnetPypesClient:
             for oid in oids:
                 if _is_device_object_type(oid[0]):
                     continue
-                ot = str(oid[0])
                 oi = int(oid[1])
                 entry = await _build_snapshot_style_object_entry(
-                    app, addr, di, ot, oi, read_timeout, errors
+                    app,
+                    addr,
+                    di,
+                    oid[0],
+                    oi,
+                    read_timeout,
+                    errors,
+                    read_oid=oid,
                 )
                 objects.append(entry)
 
@@ -892,10 +951,16 @@ class BacnetPypesClient:
             if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                 truncated_by_time = True
                 break
-            ot = str(oid[0])
             oi = int(oid[1])
             entry = await _build_snapshot_style_object_entry(
-                app, addr, device_instance, ot, oi, read_timeout, errors
+                app,
+                addr,
+                device_instance,
+                oid[0],
+                oi,
+                read_timeout,
+                errors,
+                read_oid=oid,
             )
             objects_out.append(entry)
 
@@ -1011,7 +1076,6 @@ class BacnetPypesClient:
             read_ts = utc_now_iso()
             out: dict[str, Any] = dict(entry)
             out["device_instance"] = device_instance
-            out["object_type"] = object_type
             out["object_instance"] = object_instance
             out["property"] = prop
             out["present_value"] = entry.get("present_value")
