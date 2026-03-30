@@ -5,6 +5,31 @@ from __future__ import annotations
 import re
 from typing import Any, Optional, Type
 
+
+def failure_message(obj: Any, *, default: str = "operation failed") -> str:
+    """
+    BACnet Error/Reject/Abort and some stack types can stringify to empty text.
+    Job results and write_results must always carry a non-empty error string for SaaS/UI.
+    """
+    if obj is None:
+        return default
+    if isinstance(obj, str):
+        t = obj.strip()
+        return t if t else default
+    try:
+        s = str(obj).strip()
+    except Exception:
+        s = ""
+    if s:
+        return s
+    try:
+        r = repr(obj).strip()
+    except Exception:
+        r = ""
+    if r and r not in ("", "''", '""'):
+        return r
+    return f"{default} ({type(obj).__name__})"
+
 # BACpypes constructed values often stringify to Python repr, not a BACnet value.
 _REPR_LEAK = re.compile(r"^<[\w.]+ object at 0x[0-9a-f]+\>$", re.IGNORECASE)
 

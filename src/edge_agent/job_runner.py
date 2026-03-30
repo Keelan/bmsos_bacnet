@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from bacpypes3.apdu import ErrorRejectAbortNack
 
-from edge_agent.json_safe import to_json_safe
+from edge_agent.json_safe import failure_message, to_json_safe
 from edge_agent.models import (
     BacnetClient,
     JobModel,
@@ -202,7 +202,13 @@ async def run_job(
                 summary = "Read OK"
                 if rd.get("error"):
                     status = "failed"
-                    errors.append({"message": str(rd["error"])})
+                    errors.append(
+                        {
+                            "message": failure_message(
+                                rd["error"], default="read_point failed"
+                            ),
+                        }
+                    )
                 elif pe:
                     status = "partial_success"
             except (ErrorRejectAbortNack, Exception) as e:
@@ -244,7 +250,9 @@ async def run_job(
                     data = wr
                     if wr.get("error") and not wr.get("write_results"):
                         status = "failed"
-                        summary = str(wr["error"])
+                        summary = failure_message(
+                            wr["error"], default="write_point failed"
+                        )
                         errors.append({"message": summary, "device_instance": dev})
                     else:
                         results = wr.get("write_results", [])
@@ -252,9 +260,10 @@ async def run_job(
                         fail_c = len(results) - ok_c
                         for r in results:
                             if not r.get("ok"):
-                                werr = r.get("error")
-                                if not werr:
-                                    werr = "write failed"
+                                werr = failure_message(
+                                    r.get("error"),
+                                    default=f"write failed (index {r.get('index')})",
+                                )
                                 errors.append(
                                     {
                                         "device_instance": dev,
@@ -370,10 +379,10 @@ async def run_job(
                         if wr.get("error"):
                             status = "failed"
                             summary = "Write failed"
-                            wmsg = wr.get("error")
-                            errors.append(
-                                {"message": (wmsg or "Write failed")}
+                            wmsg = failure_message(
+                                wr.get("error"), default="Write failed"
                             )
+                            errors.append({"message": wmsg})
                         else:
                             summary = "Write OK"
                         data = wr

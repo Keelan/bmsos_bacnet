@@ -40,6 +40,8 @@ class MockBacnetClient:
                     "status_flags": None,
                     "out_of_service": False,
                     "reliability": "noFaultDetected",
+                    "relinquish_default": 18.0,
+                    "priority_array": [None] * 15 + [21.5],
                 },
                 {
                     "object_type": "binaryValue",
@@ -54,6 +56,8 @@ class MockBacnetClient:
                     "status_flags": None,
                     "out_of_service": False,
                     "reliability": "noFaultDetected",
+                    "relinquish_default": "inactive",
+                    "priority_array": [None] * 16,
                 },
                 {
                     "object_type": "multiStateValue",
@@ -68,6 +72,8 @@ class MockBacnetClient:
                     "status_flags": None,
                     "out_of_service": False,
                     "reliability": "noFaultDetected",
+                    "relinquish_default": 1,
+                    "priority_array": [None] * 16,
                 },
             ]
             row = {
@@ -122,6 +128,7 @@ class MockBacnetClient:
                 "out_of_service": False,
                 "reliability": "noFaultDetected",
                 "relinquish_default": 18.0,
+                "priority_array": [None] * 15 + [21.5],
             },
             {
                 "object_type": "binaryValue",
@@ -137,6 +144,7 @@ class MockBacnetClient:
                 "out_of_service": False,
                 "reliability": "noFaultDetected",
                 "relinquish_default": "inactive",
+                "priority_array": [None] * 16,
             },
             {
                 "object_type": "multiStateValue",
@@ -152,6 +160,7 @@ class MockBacnetClient:
                 "out_of_service": False,
                 "reliability": "noFaultDetected",
                 "relinquish_default": 1,
+                "priority_array": [None] * 16,
             },
         ]
         total = len(objects)

@@ -17,7 +17,7 @@ from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.pdu import Address
 from bacpypes3.primitivedata import ObjectIdentifier
 
-from edge_agent.json_safe import to_json_safe
+from edge_agent.json_safe import failure_message, to_json_safe
 from edge_agent.models import EffectiveBacnetConfig, utc_now_iso
 from edge_agent.settings import Settings
 
@@ -250,7 +250,7 @@ def _present_value_label(
     return None
 
 
-async def _snap_read_property(
+async def _snap_read_property_ex(
     app: Application,
     addr: Address,
     oid: Union[ObjectIdentifier, str],
@@ -261,7 +261,11 @@ async def _snap_read_property(
     array_index: Optional[int] = None,
     *,
     record_error: bool = True,
-) -> Any:
+) -> tuple[Any, bool]:
+    """
+    Returns (value, success). success is False on NACK/error; value may be None
+    on success (e.g. BACnet null) — caller decides whether to set a JSON key.
+    """
     try:
         if array_index is not None:
             val = await asyncio.wait_for(
@@ -275,17 +279,142 @@ async def _snap_read_property(
             )
         if isinstance(val, ErrorRejectAbortNack):
             if record_error:
-                errors.append({**err_extra, "property": prop, "message": str(val)})
-            return None
-        return val
+                errors.append(
+                    {
+                        **err_extra,
+                        "property": prop,
+                        "message": failure_message(
+                            val, default="read property rejected"
+                        ),
+                    }
+                )
+            return None, False
+        return val, True
     except ErrorRejectAbortNack as err:
         if record_error:
-            errors.append({**err_extra, "property": prop, "message": str(err)})
-        return None
+            errors.append(
+                {
+                    **err_extra,
+                    "property": prop,
+                    "message": failure_message(
+                        err, default="read property rejected"
+                    ),
+                }
+            )
+        return None, False
     except Exception as e:
         if record_error:
-            errors.append({**err_extra, "property": prop, "message": str(e)})
-        return None
+            errors.append(
+                {
+                    **err_extra,
+                    "property": prop,
+                    "message": failure_message(
+                        e, default="read property exception"
+                    ),
+                }
+            )
+        return None, False
+
+
+async def _snap_read_property(
+    app: Application,
+    addr: Address,
+    oid: Union[ObjectIdentifier, str],
+    prop: str,
+    read_timeout: float,
+    errors: list[dict[str, Any]],
+    err_extra: dict[str, Any],
+    array_index: Optional[int] = None,
+    *,
+    record_error: bool = True,
+) -> Any:
+    val, _ok = await _snap_read_property_ex(
+        app,
+        addr,
+        oid,
+        prop,
+        read_timeout,
+        errors,
+        err_extra,
+        array_index,
+        record_error=record_error,
+    )
+    return val
+
+
+def _priority_array_whole_is_usable(whole: Any) -> bool:
+    if whole is None:
+        return False
+    try:
+        n = len(whole)
+    except TypeError:
+        return False
+    return n == 16
+
+
+async def _read_priority_array_for_snapshot(
+    app: Application,
+    addr: Address,
+    oid: str,
+    read_timeout: float,
+    errors: list[dict[str, Any]],
+    err_extra: dict[str, Any],
+) -> list[Any]:
+    """
+    Many devices reject or truncate a single ReadProperty on the full
+    priority-array; fall back to indexed reads 1..16 (like state-text).
+    """
+    whole, whole_ok = await _snap_read_property_ex(
+        app,
+        addr,
+        oid,
+        "priority-array",
+        read_timeout,
+        errors,
+        err_extra,
+        record_error=False,
+    )
+    if whole_ok and _priority_array_whole_is_usable(whole):
+        return list(whole)
+
+    slots: list[Any] = []
+    for i in range(1, 17):
+        part, _ok = await _snap_read_property_ex(
+            app,
+            addr,
+            oid,
+            "priority-array",
+            read_timeout,
+            errors,
+            err_extra,
+            array_index=i,
+            record_error=False,
+        )
+        slots.append(part)
+    return slots
+
+
+def _bacnet_null_priority_value() -> Any:
+    """BACnet relinquish at a priority slot requires PriorityValue(null), not Python None."""
+    from bacpypes3.basetypes import PriorityValue
+    from bacpypes3.primitivedata import Null
+
+    return PriorityValue(Null(()))
+
+
+def _normalize_write_value_for_bacnet(
+    pid: str,
+    val: Any,
+    priority: Optional[int],
+    array_index: Optional[int],
+) -> Any:
+    if val is not None:
+        return val
+    if pid == "priority-array" and array_index is not None:
+        return _bacnet_null_priority_value()
+    if pid == "present-value" and priority is not None:
+        return _bacnet_null_priority_value()
+    return val
 
 
 def _iter_state_text_sequence(raw: Any) -> Optional[list[str]]:
@@ -390,6 +519,18 @@ async def _build_snapshot_style_object_entry(
     for prop, key in plan:
         if present_value_precooked is not None and key == "present_value":
             entry[key] = present_value_precooked
+            continue
+        if key == "priority_array":
+            entry[key] = await _read_priority_array_for_snapshot(
+                app, addr, oid, read_timeout, errors, err_obj
+            )
+            continue
+        if key == "relinquish_default":
+            val_rd, ok_rd = await _snap_read_property_ex(
+                app, addr, oid, prop, read_timeout, errors, err_obj
+            )
+            if ok_rd:
+                entry[key] = val_rd
             continue
         val = await _snap_read_property(
             app, addr, oid, prop, read_timeout, errors, err_obj
@@ -526,10 +667,18 @@ class BacnetPypesClient:
             fut = app.who_is(0, 4194303, timeout=who_is_timeout)
             i_ams = await asyncio.wait_for(fut, timeout=who_is_timeout + 2.0)
         except ErrorRejectAbortNack as e:
-            errors.append({"message": f"who_is failed: {e}"})
+            errors.append(
+                {
+                    "message": f"who_is failed: {failure_message(e, default='rejected')}",
+                }
+            )
             return devices, errors
         except Exception as e:
-            errors.append({"message": f"who_is failed: {e}"})
+            errors.append(
+                {
+                    "message": f"who_is failed: {failure_message(e, default='failed')}",
+                }
+            )
             return devices, errors
 
         for i_am in i_ams:
@@ -549,7 +698,12 @@ class BacnetPypesClient:
                     }
                 )
             except Exception as e:
-                errors.append({"message": str(e), "raw": "i_am_parse"})
+                errors.append(
+                    {
+                        "message": failure_message(e, default="i_am parse failed"),
+                        "raw": "i_am_parse",
+                    }
+                )
         return devices, errors
 
     async def snapshot_network(self, who_is_timeout: float, read_timeout: float) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -570,10 +724,20 @@ class BacnetPypesClient:
                     timeout=read_timeout,
                 )
             except ErrorRejectAbortNack as e:
-                errors.append({"device_instance": di, "message": f"object-list: {e}"})
+                errors.append(
+                    {
+                        "device_instance": di,
+                        "message": f"object-list: {failure_message(e, default='rejected')}",
+                    }
+                )
                 continue
             except Exception as e:
-                errors.append({"device_instance": di, "message": f"object-list: {e}"})
+                errors.append(
+                    {
+                        "device_instance": di,
+                        "message": f"object-list: {failure_message(e, default='failed')}",
+                    }
+                )
                 continue
 
             err_dev: dict[str, Any] = {"device_instance": di}
@@ -646,12 +810,18 @@ class BacnetPypesClient:
             )
         except ErrorRejectAbortNack as e:
             errors.append(
-                {"device_instance": device_instance, "message": f"who_is: {e}"}
+                {
+                    "device_instance": device_instance,
+                    "message": f"who_is: {failure_message(e, default='rejected')}",
+                }
             )
             return empty_data, errors
         except Exception as e:
             errors.append(
-                {"device_instance": device_instance, "message": f"who_is: {e}"}
+                {
+                    "device_instance": device_instance,
+                    "message": f"who_is: {failure_message(e, default='failed')}",
+                }
             )
             return empty_data, errors
 
@@ -676,7 +846,7 @@ class BacnetPypesClient:
             errors.append(
                 {
                     "device_instance": device_instance,
-                    "message": f"object-list: {e}",
+                    "message": f"object-list: {failure_message(e, default='rejected')}",
                 }
             )
             return empty_data, errors
@@ -684,7 +854,7 @@ class BacnetPypesClient:
             errors.append(
                 {
                     "device_instance": device_instance,
-                    "message": f"object-list: {e}",
+                    "message": f"object-list: {failure_message(e, default='failed')}",
                 }
             )
             return empty_data, errors
@@ -769,7 +939,7 @@ class BacnetPypesClient:
                 "object_instance": object_instance,
                 "property": prop,
                 "array_index": arr_idx,
-                "error": str(e),
+                "error": failure_message(e, default="who-is failed"),
             }
         except Exception as e:
             return {
@@ -778,7 +948,7 @@ class BacnetPypesClient:
                 "object_instance": object_instance,
                 "property": prop,
                 "array_index": arr_idx,
-                "error": str(e),
+                "error": failure_message(e, default="who-is exception"),
             }
         if not i_ams:
             return {
@@ -804,7 +974,9 @@ class BacnetPypesClient:
                         "object_type": object_type,
                         "object_instance": object_instance,
                         "property": prop,
-                        "error": str(val),
+                        "error": failure_message(
+                            val, default="read present-value rejected"
+                        ),
                     }
             except ErrorRejectAbortNack as err:
                 return {
@@ -812,7 +984,9 @@ class BacnetPypesClient:
                     "object_type": object_type,
                     "object_instance": object_instance,
                     "property": prop,
-                    "error": str(err),
+                    "error": failure_message(
+                        err, default="read present-value rejected"
+                    ),
                 }
             except Exception as e:
                 return {
@@ -820,7 +994,7 @@ class BacnetPypesClient:
                     "object_type": object_type,
                     "object_instance": object_instance,
                     "property": prop,
-                    "error": str(e),
+                    "error": failure_message(e, default="read present-value failed"),
                 }
 
             enrich_errors: list[dict[str, Any]] = []
@@ -863,6 +1037,35 @@ class BacnetPypesClient:
                 "error": "empty property id",
             }
         try:
+            if pid == "priority-array" and arr_idx is None:
+                pe: list[dict[str, Any]] = []
+                pa_list = await _read_priority_array_for_snapshot(
+                    app,
+                    addr,
+                    ois,
+                    read_timeout,
+                    pe,
+                    {
+                        "device_instance": device_instance,
+                        "object_type": object_type,
+                        "object_instance": object_instance,
+                    },
+                )
+                safe = to_json_safe(pa_list)
+                out_pa: dict[str, Any] = {
+                    "device_instance": device_instance,
+                    "object_type": object_type,
+                    "object_instance": object_instance,
+                    "property": prop,
+                    "bacnet_property": pid,
+                    "value": safe,
+                    "datatype": "list",
+                    "read_at": utc_now_iso(),
+                }
+                if pe:
+                    out_pa["_property_errors"] = pe
+                return out_pa
+
             if arr_idx is not None:
                 val = await asyncio.wait_for(
                     app.read_property(
@@ -883,7 +1086,7 @@ class BacnetPypesClient:
                     "property": prop,
                     "bacnet_property": pid,
                     "array_index": arr_idx,
-                    "error": str(val),
+                    "error": failure_message(val, default="read property rejected"),
                 }
             safe = to_json_safe(val)
             out: dict[str, Any] = {
@@ -907,7 +1110,7 @@ class BacnetPypesClient:
                 "property": prop,
                 "bacnet_property": pid,
                 "array_index": arr_idx,
-                "error": str(err),
+                "error": failure_message(err, default="read property rejected"),
             }
         except Exception as e:
             return {
@@ -917,7 +1120,7 @@ class BacnetPypesClient:
                 "property": prop,
                 "bacnet_property": pid,
                 "array_index": arr_idx,
-                "error": str(e),
+                "error": failure_message(e, default="read property failed"),
             }
 
     async def _resolve_device_address(
@@ -933,9 +1136,13 @@ class BacnetPypesClient:
                 timeout=self._settings.who_is_timeout_seconds + 2.0,
             )
         except ErrorRejectAbortNack as e:
-            return None, str(e)
+            return None, failure_message(
+                e, default="who-is / address resolution rejected"
+            )
         except Exception as e:
-            return None, str(e)
+            return None, failure_message(
+                e, default="who-is / address resolution failed"
+            )
         if not i_ams:
             return None, "device not found (I-Am)"
         return Address(i_ams[0].pduSource), None
@@ -952,6 +1159,7 @@ class BacnetPypesClient:
         array_index: Optional[int],
     ) -> Union[Any, ErrorRejectAbortNack]:
         """Single BACnet WriteProperty; priority only for present-value; array_index for arrays."""
+        val = _normalize_write_value_for_bacnet(pid, val, priority, array_index)
         if pid == "present-value":
             if array_index is not None and priority is None:
                 raise ValueError(
@@ -1007,7 +1215,9 @@ class BacnetPypesClient:
         addr, addr_err = await self._resolve_device_address(device_instance)
         if addr_err:
             return {
-                "error": addr_err,
+                "error": failure_message(
+                    addr_err, default="device address resolution failed"
+                ),
                 "device_instance": device_instance,
                 "write_results": [],
             }
@@ -1136,7 +1346,9 @@ class BacnetPypesClient:
                             "property": str(prop_raw),
                             "bacnet_property": pid,
                             "ok": False,
-                            "error": str(resp),
+                            "error": failure_message(
+                                resp, default="BACnet write rejected"
+                            ),
                         }
                     )
                 else:
@@ -1155,7 +1367,7 @@ class BacnetPypesClient:
                         "property": str(prop_raw),
                         "bacnet_property": pid,
                         "ok": False,
-                        "error": str(err),
+                        "error": failure_message(err, default="BACnet write rejected"),
                     }
                 )
             except Exception as e:
@@ -1165,9 +1377,17 @@ class BacnetPypesClient:
                         "property": str(prop_raw),
                         "bacnet_property": pid,
                         "ok": False,
-                        "error": str(e),
+                        "error": failure_message(e, default="write raised exception"),
                     }
                 )
+
+        for row in write_results:
+            if row.get("ok"):
+                continue
+            row["error"] = failure_message(
+                row.get("error"),
+                default=f"write failed (index {row.get('index')})",
+            )
 
         result: dict[str, Any] = {
             "device_instance": device_instance,
@@ -1194,12 +1414,16 @@ class BacnetPypesClient:
                     )
                     if isinstance(pv, ErrorRejectAbortNack):
                         rb_obj[jkey] = None
-                        rb_obj[f"{jkey}_error"] = str(pv)
+                        rb_obj[f"{jkey}_error"] = failure_message(
+                            pv, default="readback rejected"
+                        )
                     else:
                         rb_obj[jkey] = to_json_safe(pv)
                 except (ErrorRejectAbortNack, Exception) as e:
                     rb_obj[jkey] = None
-                    rb_obj[f"{jkey}_error"] = str(e)
+                    rb_obj[f"{jkey}_error"] = failure_message(
+                        e, default="readback failed"
+                    )
             result["readback"] = rb_obj
             result["read_at"] = rb_at
 
@@ -1217,7 +1441,11 @@ class BacnetPypesClient:
     ) -> dict[str, Any]:
         addr, addr_err = await self._resolve_device_address(device_instance)
         if addr_err:
-            return {"error": addr_err}
+            return {
+                "error": failure_message(
+                    addr_err, default="device address resolution failed"
+                )
+            }
         app = self._require_app()
         ois = _object_id_string(object_type, object_instance)
         try:
@@ -1239,7 +1467,7 @@ class BacnetPypesClient:
                     "property": "presentValue",
                     "value": value,
                     "priority": priority,
-                    "error": str(resp),
+                    "error": failure_message(resp, default="BACnet write rejected"),
                 }
             result: dict[str, Any] = {
                 "device_instance": device_instance,
@@ -1272,7 +1500,7 @@ class BacnetPypesClient:
                 "property": "presentValue",
                 "value": value,
                 "priority": priority,
-                "error": str(err),
+                "error": failure_message(err, default="BACnet write rejected"),
             }
         except Exception as e:
             return {
@@ -1282,5 +1510,5 @@ class BacnetPypesClient:
                 "property": "presentValue",
                 "value": value,
                 "priority": priority,
-                "error": str(e),
+                "error": failure_message(e, default="write raised exception"),
             }
