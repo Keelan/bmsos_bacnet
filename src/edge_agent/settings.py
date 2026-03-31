@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     saas_max_retries: int = 5
     saas_retry_backoff_seconds: float = 0.5
 
+    # Edge status BACnet binary inputs + SaaS "online" window (align with Laravel config('edge.online_threshold_seconds')).
+    edge_status_check_interval_seconds: float = 30.0
+    saas_online_threshold_seconds: float = 120.0
+    internet_check_url: str = "https://www.google.com/generate_204"
+    internet_check_timeout_seconds: float = 5.0
+
     @property
     def saas_base(self) -> str:
         return self.saas_base_url.rstrip("/")

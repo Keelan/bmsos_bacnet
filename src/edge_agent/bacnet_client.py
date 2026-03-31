@@ -14,8 +14,10 @@ from typing import Any, Optional, Union
 from bacpypes3.apdu import AbortPDU, AbortReason, ErrorRejectAbortNack
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
+from bacpypes3.basetypes import BinaryPV, EventState, Polarity, StatusFlags
+from bacpypes3.local.binary import BinaryInputObject
 from bacpypes3.pdu import Address
-from bacpypes3.primitivedata import ObjectIdentifier
+from bacpypes3.primitivedata import Boolean, CharacterString, ObjectIdentifier
 
 from edge_agent.json_safe import failure_message, to_json_safe
 from edge_agent.models import EffectiveBacnetConfig, utc_now_iso
@@ -677,6 +679,38 @@ async def _build_snapshot_style_object_entry(
     return entry
 
 
+def _create_edge_status_binary_inputs() -> tuple[BinaryInputObject, BinaryInputObject]:
+    """
+    Two local binary-input objects on the edge device: WAN check and SaaS heartbeat liveness.
+    inactive/active texts are Offline/Online (present-value label via BACnet state text).
+    """
+    def _bi_common() -> dict[str, Any]:
+        return {
+            "statusFlags": StatusFlags([0, 0, 0, 0]),
+            "eventState": EventState.normal,
+            "outOfService": Boolean(False),
+            "polarity": Polarity.normal,
+            "inactiveText": CharacterString("Offline"),
+            "activeText": CharacterString("Online"),
+        }
+
+    internet = BinaryInputObject(
+        objectIdentifier=ObjectIdentifier("binary-input,1"),
+        objectName=CharacterString("Edge-Internet"),
+        presentValue=BinaryPV.inactive,
+        description=CharacterString("Internet / WAN (HTTP reachability)"),
+        **_bi_common(),
+    )
+    saas = BinaryInputObject(
+        objectIdentifier=ObjectIdentifier("binary-input,2"),
+        objectName=CharacterString("Edge-SaaS"),
+        presentValue=BinaryPV.inactive,
+        description=CharacterString("SaaS API heartbeat within online threshold"),
+        **_bi_common(),
+    )
+    return internet, saas
+
+
 class BacnetPypesClient:
     """Wraps BACpypes3 Application; recreate via manager on config change."""
 
@@ -684,6 +718,8 @@ class BacnetPypesClient:
         self._settings = settings
         self._effective = effective
         self._app: Optional[Application] = None
+        self._bi_internet: Optional[BinaryInputObject] = None
+        self._bi_saas: Optional[BinaryInputObject] = None
 
     def _build_application(self) -> Application:
         # BACpypes3 snapshots BACPYPES_* from os.environ when bacpypes3.argparse is
@@ -707,7 +743,19 @@ class BacnetPypesClient:
             cli.extend(["--address", addr])
         args = parser.parse_args(cli)
         app = Application.from_args(args)
+        bi_internet, bi_saas = _create_edge_status_binary_inputs()
+        app.add_object(bi_internet)
+        app.add_object(bi_saas)
+        self._bi_internet = bi_internet
+        self._bi_saas = bi_saas
         return app
+
+    def update_edge_status_binary_inputs(self, internet_ok: bool, saas_ok: bool) -> None:
+        """Update present-value for Edge-Internet and Edge-SaaS binary-input objects."""
+        if self._bi_internet is None or self._bi_saas is None:
+            return
+        self._bi_internet.presentValue = BinaryPV.active if internet_ok else BinaryPV.inactive
+        self._bi_saas.presentValue = BinaryPV.active if saas_ok else BinaryPV.inactive
 
     async def start(self) -> None:
         if self._app is not None:
@@ -734,6 +782,8 @@ class BacnetPypesClient:
             self._app.close()
             self._app = None
             _log.info("bacnet_stack_stopped")
+        self._bi_internet = None
+        self._bi_saas = None
 
     async def restart(self, effective: EffectiveBacnetConfig) -> None:
         await self.stop()

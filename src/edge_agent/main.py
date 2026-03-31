@@ -9,6 +9,7 @@ import time
 import traceback
 from typing import Any, Optional, Union
 
+import httpx
 from bacpypes3.apdu import ErrorRejectAbortNack
 
 from edge_agent.bacnet_client import BacnetPypesClient
@@ -27,6 +28,13 @@ from edge_agent.settings import Settings
 from edge_agent.storage import Storage
 
 _log = logging.getLogger(__name__)
+
+
+class _HeartbeatState:
+    __slots__ = ("last_ok_at",)
+
+    def __init__(self) -> None:
+        self.last_ok_at: Optional[float] = None
 
 
 def _local_ip() -> str:
@@ -116,6 +124,21 @@ async def _heartbeat_body(settings: Settings, storage: Storage) -> dict[str, Any
     }
 
 
+async def _check_internet(settings: Settings) -> bool:
+    """True when an HTTP(S) GET to `internet_check_url` returns 2xx (captures proxy/WAN)."""
+    url = (settings.internet_check_url or "").strip()
+    if not url:
+        return False
+    timeout = httpx.Timeout(settings.internet_check_timeout_seconds)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            r = await client.get(url)
+            return 200 <= r.status_code < 300
+    except Exception as e:
+        _log.debug("internet_check_failed err=%s", e)
+        return False
+
+
 async def _run_forever(settings: Settings) -> None:
     storage = Storage(settings.local_db_path)
     saas = SaasClient(settings)
@@ -123,6 +146,7 @@ async def _run_forever(settings: Settings) -> None:
     await _ensure_bacnet_started(bacnet)
 
     job_lock = asyncio.Lock()
+    hb_state = _HeartbeatState()
 
     async def heartbeat_task() -> None:
         while True:
@@ -135,7 +159,30 @@ async def _run_forever(settings: Settings) -> None:
                     600.0,
                 )
             )
-            await saas.heartbeat(await _heartbeat_body(settings, storage))
+            if await saas.heartbeat(await _heartbeat_body(settings, storage)):
+                hb_state.last_ok_at = time.time()
+
+    async def edge_status_task() -> None:
+        while True:
+            try:
+                if isinstance(bacnet, BacnetPypesClient):
+                    internet_ok = await _check_internet(settings)
+                    now = time.time()
+                    saas_ok = hb_state.last_ok_at is not None and (
+                        now - hb_state.last_ok_at
+                    ) < settings.saas_online_threshold_seconds
+                    bacnet.update_edge_status_binary_inputs(internet_ok, saas_ok)
+            except Exception as e:
+                _log.warning("edge_status_update_failed err=%s", e)
+            await asyncio.sleep(
+                apply_float_tuning(
+                    settings.edge_status_check_interval_seconds,
+                    storage.get_remote_agent_tuning(),
+                    "edge_status_check_interval_seconds",
+                    5.0,
+                    600.0,
+                )
+            )
 
     async def config_task() -> None:
         while True:
@@ -196,8 +243,9 @@ async def _run_forever(settings: Settings) -> None:
                     _log.error("post_result_failed job_id=%s err=%s", job.job_id, e)
 
     try:
-        await saas.heartbeat(await _heartbeat_body(settings, storage))
-        await asyncio.gather(heartbeat_task(), config_task(), job_task())
+        if await saas.heartbeat(await _heartbeat_body(settings, storage)):
+            hb_state.last_ok_at = time.time()
+        await asyncio.gather(heartbeat_task(), config_task(), job_task(), edge_status_task())
     finally:
         await _stop_bacnet(bacnet)
         await saas.aclose()

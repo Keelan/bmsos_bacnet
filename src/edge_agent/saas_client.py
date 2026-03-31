@@ -66,11 +66,13 @@ class SaasClient:
         path = f"/api/edge/v1/jobs/{job_id}/result"
         await self._post_json(path, body)
 
-    async def heartbeat(self, body: dict[str, Any]) -> None:
+    async def heartbeat(self, body: dict[str, Any]) -> bool:
         try:
             await self._post_json("/api/edge/v1/heartbeat", body)
+            return True
         except Exception as e:
             _log.warning("heartbeat_failed err=%s", e)
+            return False
 
     async def fetch_config(self, config_revision: Optional[int]) -> ConfigPullResponse:
         try:

@@ -27,6 +27,7 @@ class RemoteAgentTuning(BaseModel):
     poll_interval_seconds: Optional[float] = None
     heartbeat_interval_seconds: Optional[float] = None
     config_poll_interval_seconds: Optional[float] = None
+    edge_status_check_interval_seconds: Optional[float] = None
     who_is_timeout_seconds: Optional[float] = None
     read_device_live_max_objects: Optional[int] = None
     read_device_live_timeout_seconds: Optional[float] = None
