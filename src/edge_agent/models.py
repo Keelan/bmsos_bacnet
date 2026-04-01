@@ -210,3 +210,22 @@ class BacnetClient(Protocol):
         readback_properties: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         ...
+
+    async def create_object(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: Optional[int],
+        initial_properties: Optional[list[dict[str, Any]]],
+        write_timeout: float,
+    ) -> dict[str, Any]:
+        ...
+
+    async def delete_object(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: int,
+        write_timeout: float,
+    ) -> dict[str, Any]:
+        ...

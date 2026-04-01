@@ -12,13 +12,30 @@ from typing import Any, Optional, Union
 
 # ErrorRejectAbortNack subclasses BaseException, not Exception — BACnet errors
 # are not caught by `except Exception`.
-from bacpypes3.apdu import AbortPDU, AbortReason, ErrorRejectAbortNack
+from bacpypes3.apdu import (
+    AbortPDU,
+    AbortReason,
+    CreateObjectACK,
+    CreateObjectRequest,
+    DeleteObjectRequest,
+    ErrorRejectAbortNack,
+    SimpleAckPDU,
+)
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
-from bacpypes3.basetypes import BinaryPV, EventState, ObjectTypesSupported, Polarity, StatusFlags
+from bacpypes3.basetypes import (
+    BinaryPV,
+    CreateObjectRequestObjectSpecifier,
+    EventState,
+    ObjectTypesSupported,
+    Polarity,
+    PropertyValue,
+    StatusFlags,
+)
+from bacpypes3.constructeddata import Array, SequenceOf
 from bacpypes3.local.binary import BinaryInputObject
 from bacpypes3.pdu import Address
-from bacpypes3.primitivedata import Boolean, CharacterString, ObjectIdentifier
+from bacpypes3.primitivedata import Boolean, CharacterString, Null, ObjectIdentifier, Unsigned
 
 from edge_agent.json_safe import failure_message, to_json_safe
 from edge_agent.models import EffectiveBacnetConfig, utc_now_iso
@@ -503,6 +520,130 @@ def _normalize_write_value_for_bacnet(
     if pid == "present-value" and priority is not None:
         return _bacnet_relinquish_present_value_as_null()
     return val
+
+
+async def _list_of_initial_values_for_create_object(
+    app: Application,
+    addr: Address,
+    vendor_info: Any,
+    new_object_type_str: str,
+    initial_properties: list[dict[str, Any]],
+) -> tuple[Optional[Any], Optional[str]]:
+    """
+    Build BACnet SequenceOf(PropertyValue) for CreateObject listOfInitialValues.
+    Uses the same property typing/coercion rules as WriteProperty.
+    Returns (None, None) when initial_properties is empty (omit listOfInitialValues).
+    """
+    if not initial_properties:
+        return None, None
+
+    try:
+        oid_template = await app.parse_object_identifier(
+            _object_id_string(new_object_type_str, 1),
+            vendor_info=vendor_info,
+        )
+    except (TypeError, ValueError) as e:
+        return None, failure_message(e, default="invalid object_type for create")
+
+    object_class = vendor_info.get_object_class(oid_template[0])
+    if not object_class:
+        return None, "no object class for type (vendor mapping)"
+
+    # Match CreateObjectRequest.listOfInitialValues (bacpypes3 apdu.py).
+    seq_cls = SequenceOf(PropertyValue, _context=1, _optional=True)
+    out: list[PropertyValue] = []
+
+    for spec in initial_properties:
+        if not isinstance(spec, dict):
+            return None, "initial_properties entry must be an object"
+        prop_raw = spec.get("property")
+        if prop_raw is None or str(prop_raw).strip() == "":
+            return None, "missing property in initial_properties"
+        if "value" not in spec:
+            return None, "missing value in initial_properties (use null when applicable)"
+
+        pid = _bacnet_property_identifier(str(prop_raw))
+        if not pid:
+            return None, "empty property id"
+
+        val = spec["value"]
+        pri = spec.get("priority")
+        if pri is not None:
+            pri = int(pri)
+        arr_idx = spec.get("array_index")
+        if arr_idx is not None:
+            arr_idx = int(arr_idx)
+
+        if pid == "present-value":
+            if val is None and pri is None:
+                return None, (
+                    "present-value null (relinquish) requires priority 1-16 in "
+                    "initial_properties, or use priority-array with array_index"
+                )
+            if pri is not None and (pri < 1 or pri > 16):
+                return None, "priority must be 1-16 for present-value"
+        if pid == "priority-array" and arr_idx is None:
+            return None, "priority-array requires array_index (1-16)"
+        if (
+            pid == "priority-array"
+            and arr_idx is not None
+            and (arr_idx < 1 or arr_idx > 16)
+        ):
+            return None, "priority-array array_index must be 1-16"
+        if pid == "present-value":
+            if arr_idx is not None and pri is None:
+                return None, (
+                    "present-value uses BACnet priority (1-16), not array_index; "
+                    "omit array_index, set priority for that slot, or use property "
+                    "priority-array with array_index"
+                )
+
+        val = _normalize_write_value_for_bacnet(pid, val, pri, arr_idx)
+
+        try:
+            prop_ref = await app.parse_property_reference(
+                pid, vendor_info=vendor_info
+            )
+        except (TypeError, ValueError) as e:
+            return None, failure_message(e, default="invalid property reference")
+
+        prop_enum = prop_ref.propertyIdentifier
+        if prop_ref.propertyArrayIndex is not None and arr_idx is None:
+            arr_idx = int(prop_ref.propertyArrayIndex)
+
+        property_type = object_class.get_property_type(prop_enum)
+        if not property_type:
+            return None, f"unknown property for object type: {pid}"
+
+        if issubclass(property_type, Array):
+            if arr_idx is None:
+                pass
+            elif arr_idx == 0:
+                property_type = Unsigned
+            else:
+                property_type = property_type._subtype
+
+        if (pri is not None) and isinstance(val, Null):
+            pass
+        elif not isinstance(val, property_type):
+            try:
+                val = property_type(val)
+            except (TypeError, ValueError) as e:
+                return None, failure_message(
+                    e, default=f"value coercion failed for {pid}"
+                )
+
+        pv = PropertyValue(
+            propertyIdentifier=prop_enum,
+            value=val,
+        )
+        if arr_idx is not None:
+            pv.propertyArrayIndex = Unsigned(arr_idx)
+        if pri is not None:
+            pv.priority = Unsigned(pri)
+        out.append(pv)
+
+    return seq_cls(out), None
 
 
 def _iter_state_text_sequence(raw: Any) -> Optional[list[str]]:
@@ -1726,3 +1867,174 @@ class BacnetPypesClient:
                 "priority": priority,
                 "error": failure_message(e, default="write raised exception"),
             }
+
+    async def create_object(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: Optional[int],
+        initial_properties: Optional[list[dict[str, Any]]],
+        write_timeout: float,
+    ) -> dict[str, Any]:
+        addr, addr_err = await self._resolve_device_address(device_instance)
+        if addr_err:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "error": failure_message(
+                    addr_err, default="device address resolution failed"
+                ),
+            }
+        app = self._require_app()
+        vendor_info = await app.get_vendor_info(device_address=addr)
+
+        spec = CreateObjectRequestObjectSpecifier()
+        try:
+            if object_instance is not None:
+                oid = await app.parse_object_identifier(
+                    _object_id_string(object_type, int(object_instance)),
+                    vendor_info=vendor_info,
+                )
+                spec.objectIdentifier = oid
+            else:
+                oid_t = await app.parse_object_identifier(
+                    _object_id_string(object_type, 1),
+                    vendor_info=vendor_info,
+                )
+                spec.objectType = oid_t[0]
+        except (TypeError, ValueError) as e:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "error": failure_message(e, default="invalid object type or instance"),
+            }
+
+        init_list = list(initial_properties) if initial_properties else []
+        list_of_vals, build_err = await _list_of_initial_values_for_create_object(
+            app, addr, vendor_info, object_type, init_list
+        )
+        if build_err:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "error": build_err,
+            }
+
+        req = CreateObjectRequest(objectSpecifier=spec, destination=addr)
+        if list_of_vals is not None:
+            req.listOfInitialValues = list_of_vals
+
+        try:
+            response = await asyncio.wait_for(
+                app.request(req),
+                timeout=write_timeout,
+            )
+        except ErrorRejectAbortNack as err:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "error": failure_message(err, default="CreateObject rejected"),
+            }
+        except Exception as e:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "error": failure_message(e, default="CreateObject failed"),
+            }
+
+        if isinstance(response, ErrorRejectAbortNack):
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "error": failure_message(response, default="CreateObject rejected"),
+            }
+        if not isinstance(response, CreateObjectACK):
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "error": "unexpected response to CreateObject",
+            }
+
+        created = response.objectIdentifier
+        ot_label = _object_type_label(created[0])
+        out: dict[str, Any] = {
+            "device_instance": device_instance,
+            "object_type": _object_type_for_json(ot_label),
+            "object_instance": int(created[1]),
+        }
+        if object_instance is not None:
+            out["requested_object_instance"] = int(object_instance)
+        return out
+
+    async def delete_object(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: int,
+        write_timeout: float,
+    ) -> dict[str, Any]:
+        addr, addr_err = await self._resolve_device_address(device_instance)
+        if addr_err:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": failure_message(
+                    addr_err, default="device address resolution failed"
+                ),
+            }
+        app = self._require_app()
+        vendor_info = await app.get_vendor_info(device_address=addr)
+        try:
+            oid = await app.parse_object_identifier(
+                _object_id_string(object_type, object_instance),
+                vendor_info=vendor_info,
+            )
+        except (TypeError, ValueError) as e:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": failure_message(e, default="invalid object type or instance"),
+            }
+
+        req = DeleteObjectRequest(objectIdentifier=oid, destination=addr)
+        try:
+            response = await asyncio.wait_for(
+                app.request(req),
+                timeout=write_timeout,
+            )
+        except ErrorRejectAbortNack as err:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": failure_message(err, default="DeleteObject rejected"),
+            }
+        except Exception as e:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": failure_message(e, default="DeleteObject failed"),
+            }
+
+        if isinstance(response, ErrorRejectAbortNack):
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": failure_message(response, default="DeleteObject rejected"),
+            }
+        if not isinstance(response, SimpleAckPDU):
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": "unexpected response to DeleteObject",
+            }
+        return {
+            "device_instance": device_instance,
+            "object_type": _object_type_for_json(object_type),
+            "object_instance": object_instance,
+        }

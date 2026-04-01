@@ -438,9 +438,107 @@ async def run_job(
                                 "value": val,
                                 "priority": pri,
                                 "outcome": "failed",
-                                "detail": str(e),
-                            },
+                            "detail": str(e),
+                        },
+                    )
+
+        elif job.type == "create_object":
+            p = job.payload
+            dev = int(p["device_instance"])
+            ot = str(p["object_type"])
+            oi_raw = p.get("object_instance")
+            oi: Optional[int] = int(oi_raw) if oi_raw is not None else None
+            init = p.get("initial_properties")
+            if init is not None and not isinstance(init, list):
+                status = "failed"
+                summary = "initial_properties must be a list or omitted"
+                errors.append({"message": summary, "device_instance": dev})
+                data = {
+                    "device_instance": dev,
+                    "object_type": ot,
+                    "error": summary,
+                }
+            else:
+                init_list: list[dict[str, Any]] = init if isinstance(init, list) else []
+                try:
+                    cr = await asyncio.wait_for(
+                        bacnet.create_object(
+                            dev,
+                            ot,
+                            oi,
+                            init_list,
+                            settings.request_timeout_seconds,
+                        ),
+                        timeout=settings.request_timeout_seconds + 5.0,
+                    )
+                    data = cr
+                    if cr.get("error"):
+                        status = "failed"
+                        summary = failure_message(
+                            cr.get("error"), default="create_object failed"
                         )
+                        errors.append({"message": summary, "device_instance": dev})
+                    else:
+                        status = "success"
+                        summary = "Object created"
+                except (ErrorRejectAbortNack, Exception) as e:
+                    status = "failed"
+                    summary = "create_object failed"
+                    data = {
+                        "device_instance": dev,
+                        "object_type": ot,
+                    }
+                    if oi is not None:
+                        data["object_instance"] = oi
+                    errors.append(
+                        {"message": str(e), "traceback": traceback.format_exc()}
+                    )
+                    _log.exception("create_object job_id=%s", job.job_id)
+
+        elif job.type == "delete_object":
+            p = job.payload
+            dev = int(p["device_instance"])
+            ot = str(p["object_type"])
+            oi = int(p["object_instance"])
+            try:
+                dr = await asyncio.wait_for(
+                    bacnet.delete_object(
+                        dev,
+                        ot,
+                        oi,
+                        settings.request_timeout_seconds,
+                    ),
+                    timeout=settings.request_timeout_seconds + 5.0,
+                )
+                data = dr
+                if dr.get("error"):
+                    status = "failed"
+                    summary = failure_message(
+                        dr.get("error"), default="delete_object failed"
+                    )
+                    errors.append(
+                        {
+                            "message": summary,
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                        }
+                    )
+                else:
+                    status = "success"
+                    summary = "Object deleted"
+            except (ErrorRejectAbortNack, Exception) as e:
+                status = "failed"
+                summary = "delete_object failed"
+                data = {
+                    "device_instance": dev,
+                    "object_type": ot,
+                    "object_instance": oi,
+                }
+                errors.append(
+                    {"message": str(e), "traceback": traceback.format_exc()}
+                )
+                _log.exception("delete_object job_id=%s", job.job_id)
 
         else:
             status = "failed"

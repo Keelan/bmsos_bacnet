@@ -338,3 +338,47 @@ class MockBacnetClient:
             result["readback"] = rb
             result["read_at"] = rb["read_at"]
         return result
+
+    async def create_object(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: Optional[int],
+        initial_properties: Optional[list[dict[str, Any]]],
+        write_timeout: float,
+    ) -> dict[str, Any]:
+        if device_instance != 2001:
+            return {
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "error": "device not found (I-Am)",
+            }
+        oi_out = int(object_instance) if object_instance is not None else 9999
+        out: dict[str, Any] = {
+            "device_instance": device_instance,
+            "object_type": object_type,
+            "object_instance": oi_out,
+        }
+        if object_instance is not None:
+            out["requested_object_instance"] = int(object_instance)
+        return out
+
+    async def delete_object(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: int,
+        write_timeout: float,
+    ) -> dict[str, Any]:
+        if device_instance != 2001:
+            return {
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "object_instance": object_instance,
+                "error": "device not found (I-Am)",
+            }
+        return {
+            "device_instance": device_instance,
+            "object_type": object_type,
+            "object_instance": object_instance,
+        }
