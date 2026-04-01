@@ -744,9 +744,12 @@ def _resolved_edge_agent_version(settings: Settings) -> str:
 
 
 def _apply_device_metadata(app: Application, settings: Settings) -> None:
-    """Set device object model-name and application-software-version (BACnet)."""
+    """Set device object vendor, model, firmware, and application-software-version (BACnet)."""
     ver = _resolved_edge_agent_version(settings)
     app.device_object.applicationSoftwareVersion = CharacterString(ver)
+    app.device_object.firmwareRevision = CharacterString(ver)
+    vendor = (settings.bacnet_vendor_name or "").strip() or "bmsOS"
+    app.device_object.vendorName = CharacterString(vendor)
     model = (settings.bacnet_model_name or "").strip() or "bmOS-edge"
     app.device_object.modelName = CharacterString(model)
 

@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     bacnet_device_name: str = "Excelsior"
     # Device object model-name (BACnet property model-name).
     bacnet_model_name: str = "bmOS-edge"
+    # Device object vendor-name (BACnet property vendor-name).
+    bacnet_vendor_name: str = "bmsOS"
     bacnet_vendor_identifier: int = 999
     bacnet_mock: bool = False
 
