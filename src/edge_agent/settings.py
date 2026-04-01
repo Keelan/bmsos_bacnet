@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     bacnet_udp_port: int = 47808
     # Local device object-name (BACpypes `--name`); remote config can override.
     bacnet_device_name: str = "Excelsior"
+    # Device object model-name (BACnet property model-name).
+    bacnet_model_name: str = "bmOS-edge"
     bacnet_vendor_identifier: int = 999
     bacnet_mock: bool = False
 

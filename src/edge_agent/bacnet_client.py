@@ -743,10 +743,12 @@ def _resolved_edge_agent_version(settings: Settings) -> str:
         return "unknown"
 
 
-def _apply_device_software_version(app: Application, settings: Settings) -> None:
-    """Set device object application-software-version (BACnet) from env / package."""
+def _apply_device_metadata(app: Application, settings: Settings) -> None:
+    """Set device object model-name and application-software-version (BACnet)."""
     ver = _resolved_edge_agent_version(settings)
     app.device_object.applicationSoftwareVersion = CharacterString(ver)
+    model = (settings.bacnet_model_name or "").strip() or "bmOS-edge"
+    app.device_object.modelName = CharacterString(model)
 
 
 class BacnetPypesClient:
@@ -782,7 +784,7 @@ class BacnetPypesClient:
         args = parser.parse_args(cli)
         app = Application.from_args(args)
         _patch_local_device_object_types_supported(app)
-        _apply_device_software_version(app, self._settings)
+        _apply_device_metadata(app, self._settings)
         bi_internet, bi_saas = _create_edge_status_binary_inputs()
         app.add_object(bi_internet)
         app.add_object(bi_saas)
