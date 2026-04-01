@@ -46,6 +46,7 @@ from bacpypes3.primitivedata import Boolean, CharacterString, Null, ObjectIdenti
 from edge_agent.json_safe import failure_message, to_json_safe
 from edge_agent.models import EffectiveBacnetConfig, JobResultEnvelope, utc_now_iso
 from edge_agent.settings import Settings
+from edge_agent.storage import Storage
 
 _log = logging.getLogger(__name__)
 
@@ -73,21 +74,6 @@ class _EdgeMultiStateInput(LocalObject, _MultiStateInputObject):
         "outOfService",
         "numberOfStates",
     )
-
-
-def _semver_to_database_revision(ver: str) -> int:
-    """Map semver (e.g. 0.1.5) to a single Unsigned for device database-revision."""
-    v = (ver or "").strip().lstrip("vV")
-    if not v:
-        return 0
-    parts = v.split(".")
-    try:
-        major = int(parts[0]) if len(parts) > 0 else 0
-        minor = int(parts[1]) if len(parts) > 1 else 0
-        patch = int(parts[2]) if len(parts) > 2 else 0
-        return major * 10000 + minor * 100 + patch
-    except ValueError:
-        return 0
 
 
 def _truncate_csv_text(s: str, max_len: int = 400) -> str:
@@ -1010,12 +996,25 @@ def _resolved_edge_agent_version(settings: Settings) -> str:
         return "unknown"
 
 
-def _apply_device_metadata(app: Application, settings: Settings) -> None:
-    """Set device object vendor, model, firmware, application version, database revision (BACnet)."""
+def _apply_device_metadata(
+    app: Application,
+    settings: Settings,
+    saas_config_revision: Optional[int],
+) -> None:
+    """
+    BACnet device metadata:
+    - application-software-version = SaaS remote config revision (same concept as heartbeat bacnet_config_revision).
+    - firmware-revision = edge-agent package / SOFTWARE_VERSION from env.
+    - database-revision = same config revision as Unsigned (0 if never synced).
+    """
     ver = _resolved_edge_agent_version(settings)
-    app.device_object.applicationSoftwareVersion = CharacterString(ver)
-    app.device_object.firmwareRevision = CharacterString(f"edge-agent {ver}")
-    app.device_object.databaseRevision = Unsigned(_semver_to_database_revision(ver))
+    app.device_object.firmwareRevision = CharacterString(ver)
+    if saas_config_revision is not None:
+        app.device_object.applicationSoftwareVersion = CharacterString(str(int(saas_config_revision)))
+        app.device_object.databaseRevision = Unsigned(int(saas_config_revision))
+    else:
+        app.device_object.applicationSoftwareVersion = CharacterString("none")
+        app.device_object.databaseRevision = Unsigned(0)
     vendor = (settings.bacnet_vendor_name or "").strip() or "bmsOS"
     app.device_object.vendorName = CharacterString(vendor)
     model = (settings.bacnet_model_name or "").strip() or "bmOS-edge"
@@ -1025,9 +1024,10 @@ def _apply_device_metadata(app: Application, settings: Settings) -> None:
 class BacnetPypesClient:
     """Wraps BACpypes3 Application; recreate via manager on config change."""
 
-    def __init__(self, settings: Settings, effective: EffectiveBacnetConfig) -> None:
+    def __init__(self, settings: Settings, effective: EffectiveBacnetConfig, storage: Storage) -> None:
         self._settings = settings
         self._effective = effective
+        self._storage = storage
         self._app: Optional[Application] = None
         self._bi_internet: Optional[BinaryInputObject] = None
         self._bi_saas: Optional[BinaryInputObject] = None
@@ -1061,7 +1061,8 @@ class BacnetPypesClient:
         args = parser.parse_args(cli)
         app = Application.from_args(args)
         _patch_local_device_object_types_supported(app)
-        _apply_device_metadata(app, self._settings)
+        rev, _ = self._storage.get_remote_config_state()
+        _apply_device_metadata(app, self._settings, rev)
         bi_internet, bi_saas = _create_edge_status_binary_inputs()
         app.add_object(bi_internet)
         app.add_object(bi_saas)
