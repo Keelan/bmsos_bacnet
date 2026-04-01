@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     bacnet_vendor_identifier: int = 999
     bacnet_mock: bool = False
 
-    software_version: str = "0.1.5"
+    software_version: str = "0.1.6"
     who_is_timeout_seconds: float = 5.0
     read_device_live_max_objects: int = 500
     read_device_live_timeout_seconds: float = 120.0

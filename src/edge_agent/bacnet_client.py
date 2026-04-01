@@ -26,22 +26,145 @@ from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.basetypes import (
     BinaryPV,
     CreateObjectRequestObjectSpecifier,
+    EngineeringUnits,
     EventState,
     ObjectTypesSupported,
     Polarity,
     PropertyValue,
     StatusFlags,
 )
-from bacpypes3.constructeddata import Array, SequenceOf
+from bacpypes3.basetypes import CharacterString as StateTextString
+from bacpypes3.constructeddata import Array, ArrayOf, SequenceOf
+from bacpypes3.local.analog import AnalogInputObject
 from bacpypes3.local.binary import BinaryInputObject
+from bacpypes3.local.object import Object as LocalObject
+from bacpypes3.object import CharacterStringValueObject as _CharacterStringValueObject
+from bacpypes3.object import MultiStateInputObject as _MultiStateInputObject
 from bacpypes3.pdu import Address
-from bacpypes3.primitivedata import Boolean, CharacterString, Null, ObjectIdentifier, Unsigned
+from bacpypes3.primitivedata import Boolean, CharacterString, Null, ObjectIdentifier, Real, Unsigned
 
 from edge_agent.json_safe import failure_message, to_json_safe
-from edge_agent.models import EffectiveBacnetConfig, utc_now_iso
+from edge_agent.models import EffectiveBacnetConfig, JobResultEnvelope, utc_now_iso
 from edge_agent.settings import Settings
 
 _log = logging.getLogger(__name__)
+
+# Multi-state-input present-value (1-based): last job lifecycle / outcome
+_JOB_MSI_IDLE = 1
+_JOB_MSI_RUNNING = 2
+_JOB_MSI_SUCCESS = 3
+_JOB_MSI_PARTIAL = 4
+_JOB_MSI_FAILED = 5
+
+
+class _EdgeCharacterStringValue(LocalObject, _CharacterStringValueObject):
+    """Local character-string-value for agent identity / last job text."""
+
+    _required = ("presentValue", "statusFlags", "eventState", "outOfService")
+
+
+class _EdgeMultiStateInput(LocalObject, _MultiStateInputObject):
+    """Local multi-state-input for last job state."""
+
+    _required = (
+        "presentValue",
+        "statusFlags",
+        "eventState",
+        "outOfService",
+        "numberOfStates",
+    )
+
+
+def _semver_to_database_revision(ver: str) -> int:
+    """Map semver (e.g. 0.1.5) to a single Unsigned for device database-revision."""
+    v = (ver or "").strip().lstrip("vV")
+    if not v:
+        return 0
+    parts = v.split(".")
+    try:
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        patch = int(parts[2]) if len(parts) > 2 else 0
+        return major * 10000 + minor * 100 + patch
+    except ValueError:
+        return 0
+
+
+def _truncate_csv_text(s: str, max_len: int = 400) -> str:
+    t = s if len(s) <= max_len else s[: max_len - 3] + "..."
+    return t
+
+
+def _create_agent_telemetry_objects() -> tuple[
+    AnalogInputObject,
+    _EdgeCharacterStringValue,
+    _EdgeCharacterStringValue,
+    _EdgeCharacterStringValue,
+    _EdgeCharacterStringValue,
+    _EdgeMultiStateInput,
+]:
+    zf = StatusFlags([0, 0, 0, 0])
+    common = {
+        "statusFlags": zf,
+        "eventState": EventState.normal,
+        "outOfService": Boolean(False),
+    }
+    ai_uptime = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,1"),
+        objectName=CharacterString("Edge-Uptime"),
+        description=CharacterString("Agent process uptime (seconds)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(1.0),
+        units=EngineeringUnits.seconds,
+        **common,
+    )
+    csv_host = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,1"),
+        objectName=CharacterString("Edge-Hostname"),
+        description=CharacterString("Host name"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    csv_box = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,2"),
+        objectName=CharacterString("Edge-BoxId"),
+        description=CharacterString("SaaS box id"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    csv_saas = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,3"),
+        objectName=CharacterString("Edge-SaaS-Base"),
+        description=CharacterString("SaaS API base URL"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    csv_job = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,4"),
+        objectName=CharacterString("Edge-LastJob"),
+        description=CharacterString("Last job id, status, summary"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    st = ArrayOf(StateTextString)(
+        [
+            StateTextString("Idle"),
+            StateTextString("Running"),
+            StateTextString("Success"),
+            StateTextString("Partial"),
+            StateTextString("Failed"),
+        ]
+    )
+    msi_job = _EdgeMultiStateInput(
+        objectIdentifier=ObjectIdentifier("multiStateInput,1"),
+        objectName=CharacterString("Edge-LastJob-State"),
+        description=CharacterString("Last job state (idle / running / outcome)"),
+        presentValue=Unsigned(_JOB_MSI_IDLE),
+        numberOfStates=Unsigned(5),
+        stateText=st,
+        **common,
+    )
+    return ai_uptime, csv_host, csv_box, csv_saas, csv_job, msi_job
 
 
 def format_bacpypes_device_address(bind_ip: str, bind_prefix: int, udp_port: int) -> str:
@@ -866,7 +989,10 @@ def _patch_local_device_object_types_supported(app: Application) -> None:
         @property
         def protocolObjectTypesSupported(self) -> ObjectTypesSupported:
             ots = ObjectTypesSupported([0] * 63)
+            ots[ObjectTypesSupported.analogInput] = 1
             ots[ObjectTypesSupported.binaryInput] = 1
+            ots[ObjectTypesSupported.multiStateInput] = 1
+            ots[ObjectTypesSupported.characterstringValue] = 1
             ots[ObjectTypesSupported.device] = 1
             ots[ObjectTypesSupported.networkPort] = 1
             return ots
@@ -885,10 +1011,11 @@ def _resolved_edge_agent_version(settings: Settings) -> str:
 
 
 def _apply_device_metadata(app: Application, settings: Settings) -> None:
-    """Set device object vendor, model, firmware, and application-software-version (BACnet)."""
+    """Set device object vendor, model, firmware, application version, database revision (BACnet)."""
     ver = _resolved_edge_agent_version(settings)
     app.device_object.applicationSoftwareVersion = CharacterString(ver)
-    app.device_object.firmwareRevision = CharacterString(ver)
+    app.device_object.firmwareRevision = CharacterString(f"edge-agent {ver}")
+    app.device_object.databaseRevision = Unsigned(_semver_to_database_revision(ver))
     vendor = (settings.bacnet_vendor_name or "").strip() or "bmsOS"
     app.device_object.vendorName = CharacterString(vendor)
     model = (settings.bacnet_model_name or "").strip() or "bmOS-edge"
@@ -904,6 +1031,12 @@ class BacnetPypesClient:
         self._app: Optional[Application] = None
         self._bi_internet: Optional[BinaryInputObject] = None
         self._bi_saas: Optional[BinaryInputObject] = None
+        self._ai_uptime: Optional[AnalogInputObject] = None
+        self._csv_hostname: Optional[_EdgeCharacterStringValue] = None
+        self._csv_box_id: Optional[_EdgeCharacterStringValue] = None
+        self._csv_saas_base: Optional[_EdgeCharacterStringValue] = None
+        self._csv_last_job: Optional[_EdgeCharacterStringValue] = None
+        self._msi_last_job: Optional[_EdgeMultiStateInput] = None
 
     def _build_application(self) -> Application:
         # BACpypes3 snapshots BACPYPES_* from os.environ when bacpypes3.argparse is
@@ -934,6 +1067,22 @@ class BacnetPypesClient:
         app.add_object(bi_saas)
         self._bi_internet = bi_internet
         self._bi_saas = bi_saas
+        (
+            ai_uptime,
+            csv_host,
+            csv_box,
+            csv_saas,
+            csv_job,
+            msi_job,
+        ) = _create_agent_telemetry_objects()
+        for o in (ai_uptime, csv_host, csv_box, csv_saas, csv_job, msi_job):
+            app.add_object(o)
+        self._ai_uptime = ai_uptime
+        self._csv_hostname = csv_host
+        self._csv_box_id = csv_box
+        self._csv_saas_base = csv_saas
+        self._csv_last_job = csv_job
+        self._msi_last_job = msi_job
         return app
 
     def update_edge_status_binary_inputs(self, internet_ok: bool, saas_ok: bool) -> None:
@@ -942,6 +1091,44 @@ class BacnetPypesClient:
             return
         self._bi_internet.presentValue = BinaryPV.active if internet_ok else BinaryPV.inactive
         self._bi_saas.presentValue = BinaryPV.active if saas_ok else BinaryPV.inactive
+
+    def update_agent_uptime_seconds(self, uptime_seconds: float) -> None:
+        """Analog-input Edge-Uptime: present value in seconds."""
+        if self._ai_uptime is None:
+            return
+        self._ai_uptime.presentValue = Real(float(uptime_seconds))
+
+    def set_agent_identity_csv(self, hostname: str, box_id: str, saas_base_url: str) -> None:
+        """Character-string values: hostname, box id, SaaS base URL."""
+        if self._csv_hostname is None or self._csv_box_id is None or self._csv_saas_base is None:
+            return
+        self._csv_hostname.presentValue = CharacterString(_truncate_csv_text(hostname, 256))
+        self._csv_box_id.presentValue = CharacterString(_truncate_csv_text(box_id, 256))
+        self._csv_saas_base.presentValue = CharacterString(_truncate_csv_text(saas_base_url, 400))
+
+    def set_last_job_running(self, job_id: str, job_type: str) -> None:
+        """Multi-state = Running; CSV = short running description."""
+        if self._msi_last_job is None or self._csv_last_job is None:
+            return
+        self._msi_last_job.presentValue = Unsigned(_JOB_MSI_RUNNING)
+        text = _truncate_csv_text(f"job_id={job_id} type={job_type} status=running")
+        self._csv_last_job.presentValue = CharacterString(text)
+
+    def set_last_job_finished(self, envelope: JobResultEnvelope) -> None:
+        """Multi-state = outcome; CSV = id, status, summary."""
+        if self._msi_last_job is None or self._csv_last_job is None:
+            return
+        if envelope.status == "success":
+            pv = _JOB_MSI_SUCCESS
+        elif envelope.status == "partial_success":
+            pv = _JOB_MSI_PARTIAL
+        else:
+            pv = _JOB_MSI_FAILED
+        self._msi_last_job.presentValue = Unsigned(pv)
+        text = _truncate_csv_text(
+            f"job_id={envelope.job_id} status={envelope.status} summary={envelope.summary or ''}"
+        )
+        self._csv_last_job.presentValue = CharacterString(text)
 
     async def start(self) -> None:
         if self._app is not None:
@@ -970,6 +1157,12 @@ class BacnetPypesClient:
             _log.info("bacnet_stack_stopped")
         self._bi_internet = None
         self._bi_saas = None
+        self._ai_uptime = None
+        self._csv_hostname = None
+        self._csv_box_id = None
+        self._csv_saas_base = None
+        self._csv_last_job = None
+        self._msi_last_job = None
 
     async def restart(self, effective: EffectiveBacnetConfig) -> None:
         await self.stop()

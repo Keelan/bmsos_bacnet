@@ -144,6 +144,12 @@ async def _run_forever(settings: Settings) -> None:
     saas = SaasClient(settings)
     bacnet = _make_bacnet(settings, storage)
     await _ensure_bacnet_started(bacnet)
+    if isinstance(bacnet, BacnetPypesClient):
+        bacnet.set_agent_identity_csv(
+            socket.gethostname(),
+            settings.box_id,
+            settings.saas_base,
+        )
 
     job_lock = asyncio.Lock()
     hb_state = _HeartbeatState()
@@ -172,6 +178,7 @@ async def _run_forever(settings: Settings) -> None:
                         now - hb_state.last_ok_at
                     ) < settings.saas_online_threshold_seconds
                     bacnet.update_edge_status_binary_inputs(internet_ok, saas_ok)
+                    bacnet.update_agent_uptime_seconds(time.monotonic())
             except Exception as e:
                 _log.warning("edge_status_update_failed err=%s", e)
             await asyncio.sleep(
@@ -220,6 +227,8 @@ async def _run_forever(settings: Settings) -> None:
                 if job is None:
                     continue
                 started = utc_now_iso()
+                if isinstance(bacnet, BacnetPypesClient):
+                    bacnet.set_last_job_running(job.job_id, job.type)
                 try:
                     envelope = await run_job(job, bacnet, storage, settings)
                 except (ErrorRejectAbortNack, Exception) as e:
@@ -234,6 +243,8 @@ async def _run_forever(settings: Settings) -> None:
                         data={},
                         errors=[{"message": str(e), "traceback": traceback.format_exc()}],
                     )
+                if isinstance(bacnet, BacnetPypesClient):
+                    bacnet.set_last_job_finished(envelope)
                 try:
                     await saas.post_result_idempotent(
                         job.job_id,
