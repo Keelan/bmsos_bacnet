@@ -14,7 +14,7 @@ from typing import Any, Optional, Union
 from bacpypes3.apdu import AbortPDU, AbortReason, ErrorRejectAbortNack
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
-from bacpypes3.basetypes import BinaryPV, EventState, Polarity, StatusFlags
+from bacpypes3.basetypes import BinaryPV, EventState, ObjectTypesSupported, Polarity, StatusFlags
 from bacpypes3.local.binary import BinaryInputObject
 from bacpypes3.pdu import Address
 from bacpypes3.primitivedata import Boolean, CharacterString, ObjectIdentifier
@@ -711,6 +711,27 @@ def _create_edge_status_binary_inputs() -> tuple[BinaryInputObject, BinaryInputO
     return internet, saas
 
 
+def _patch_local_device_object_types_supported(app: Application) -> None:
+    """
+    BACpypes3's local DeviceObject returns an empty protocol-object-types-supported
+    bitstring. Many supervisors only expose object types that are marked supported,
+    so binary-input points would not appear even though object-list contains them.
+    """
+    dev = app.device_object
+    base = dev.__class__
+
+    class _DeviceWithObjectTypesSupported(base):
+        @property
+        def protocolObjectTypesSupported(self) -> ObjectTypesSupported:
+            ots = ObjectTypesSupported([0] * 63)
+            ots[ObjectTypesSupported.binaryInput] = 1
+            ots[ObjectTypesSupported.device] = 1
+            ots[ObjectTypesSupported.networkPort] = 1
+            return ots
+
+    dev.__class__ = _DeviceWithObjectTypesSupported
+
+
 class BacnetPypesClient:
     """Wraps BACpypes3 Application; recreate via manager on config change."""
 
@@ -743,6 +764,7 @@ class BacnetPypesClient:
             cli.extend(["--address", addr])
         args = parser.parse_args(cli)
         app = Application.from_args(args)
+        _patch_local_device_object_types_supported(app)
         bi_internet, bi_saas = _create_edge_status_binary_inputs()
         app.add_object(bi_internet)
         app.add_object(bi_saas)
