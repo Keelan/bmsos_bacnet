@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+from importlib.metadata import PackageNotFoundError, version as package_version
 from typing import Any, Optional, Union
 
 # ErrorRejectAbortNack subclasses BaseException, not Exception — BACnet errors
@@ -732,6 +733,22 @@ def _patch_local_device_object_types_supported(app: Application) -> None:
     dev.__class__ = _DeviceWithObjectTypesSupported
 
 
+def _resolved_edge_agent_version(settings: Settings) -> str:
+    v = (settings.software_version or "").strip()
+    if v:
+        return v
+    try:
+        return package_version("edge-agent")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _apply_device_software_version(app: Application, settings: Settings) -> None:
+    """Set device object application-software-version (BACnet) from env / package."""
+    ver = _resolved_edge_agent_version(settings)
+    app.device_object.applicationSoftwareVersion = CharacterString(ver)
+
+
 class BacnetPypesClient:
     """Wraps BACpypes3 Application; recreate via manager on config change."""
 
@@ -765,6 +782,7 @@ class BacnetPypesClient:
         args = parser.parse_args(cli)
         app = Application.from_args(args)
         _patch_local_device_object_types_supported(app)
+        _apply_device_software_version(app, self._settings)
         bi_internet, bi_saas = _create_edge_status_binary_inputs()
         app.add_object(bi_internet)
         app.add_object(bi_saas)
