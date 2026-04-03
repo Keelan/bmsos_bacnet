@@ -58,6 +58,7 @@ from edge_agent.models import (
 from edge_agent.open_meteo import OpenMeteoResult
 from edge_agent.open_meteo_air_quality import OpenMeteoAirQualityResult
 from edge_agent.settings import Settings
+from edge_agent.site_time import SiteLocalTimeInfo
 from edge_agent.storage import Storage
 
 _log = logging.getLogger(__name__)
@@ -660,6 +661,168 @@ def _create_air_quality_objects() -> tuple[
         ai_uv,
         bi_aq_ok,
         csv_aq,
+    )
+
+
+def _create_site_time_objects() -> tuple[
+    _EdgeCharacterStringValue,
+    _EdgeCharacterStringValue,
+    _EdgeCharacterStringValue,
+    _EdgeCharacterStringValue,
+    BinaryInputObject,
+    BinaryInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+]:
+    """
+    Site-local time from system UTC + IANA zone resolved offline from weather lat/lon.
+
+    Instance reservation (no overlap with telemetry CSV 1–4, weather CSV 5, AQ CSV 6,
+    weather BI 3–4,6, AQ BI 5, edge BI 1–2, weather AI 2–15, AQ AI 34–42):
+
+    - characterstringValue 7–10: datetime / timezone / date / time strings
+    - binary-input 7–8: Site-Time-OK, Site-DST-Active
+    - analog-input 43–50: calendar components + UTC offset minutes
+    """
+    zf = StatusFlags([0, 0, 0, 0])
+    common = {
+        "statusFlags": zf,
+        "eventState": EventState.normal,
+        "outOfService": Boolean(False),
+    }
+
+    def _ai(instance: int, name: str, desc: str, units: EngineeringUnits) -> AnalogInputObject:
+        return AnalogInputObject(
+            objectIdentifier=ObjectIdentifier(f"analog-input,{instance}"),
+            objectName=CharacterString(name),
+            description=CharacterString(desc),
+            presentValue=Real(0.0),
+            covIncrement=Real(1.0),
+            units=units,
+            **common,
+        )
+
+    csv_dt = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,7"),
+        objectName=CharacterString("Site-Local-DateTime"),
+        description=CharacterString("ISO 8601 site-local date-time with UTC offset (from system clock)"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    csv_tz = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,8"),
+        objectName=CharacterString("Site-Timezone-Name"),
+        description=CharacterString("IANA timezone from weather_latitude/longitude (offline lookup)"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    csv_date = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,9"),
+        objectName=CharacterString("Site-Local-Date"),
+        description=CharacterString("Site-local calendar date YYYY-MM-DD"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    csv_time = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,10"),
+        objectName=CharacterString("Site-Local-Time"),
+        description=CharacterString("Site-local time of day HH:MM:SS (24-hour)"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    bi_ok = BinaryInputObject(
+        objectIdentifier=ObjectIdentifier("binary-input,7"),
+        objectName=CharacterString("Site-Time-OK"),
+        presentValue=BinaryPV.inactive,
+        description=CharacterString("Site-local time valid (weather lat/lon + timezone resolution)"),
+        statusFlags=StatusFlags([0, 0, 0, 0]),
+        eventState=EventState.normal,
+        outOfService=Boolean(False),
+        polarity=Polarity.normal,
+        inactiveText=CharacterString("Invalid"),
+        activeText=CharacterString("OK"),
+    )
+    bi_dst = BinaryInputObject(
+        objectIdentifier=ObjectIdentifier("binary-input,8"),
+        objectName=CharacterString("Site-DST-Active"),
+        presentValue=BinaryPV.inactive,
+        description=CharacterString("Daylight saving time active at site (zoneinfo)"),
+        statusFlags=StatusFlags([0, 0, 0, 0]),
+        eventState=EventState.normal,
+        outOfService=Boolean(False),
+        polarity=Polarity.normal,
+        inactiveText=CharacterString("Standard"),
+        activeText=CharacterString("DST"),
+    )
+    ai_y = _ai(
+        43,
+        "Site-Year",
+        "Site-local calendar year (dimensionless)",
+        EngineeringUnits.noUnits,
+    )
+    ai_mo = _ai(
+        44,
+        "Site-Month",
+        "Site-local month 1–12 (dimensionless)",
+        EngineeringUnits.noUnits,
+    )
+    ai_d = _ai(
+        45,
+        "Site-Day",
+        "Site-local day of month 1–31 (dimensionless)",
+        EngineeringUnits.noUnits,
+    )
+    ai_h = _ai(
+        46,
+        "Site-Hour",
+        "Site-local hour 0–23 (dimensionless)",
+        EngineeringUnits.noUnits,
+    )
+    ai_mi = _ai(
+        47,
+        "Site-Minute",
+        "Site-local minute 0–59 (dimensionless)",
+        EngineeringUnits.noUnits,
+    )
+    ai_s = _ai(
+        48,
+        "Site-Second",
+        "Site-local second 0–59 (dimensionless)",
+        EngineeringUnits.noUnits,
+    )
+    ai_wd = _ai(
+        49,
+        "Site-Weekday-Number",
+        "ISO weekday 1=Monday … 7=Sunday (dimensionless)",
+        EngineeringUnits.noUnits,
+    )
+    ai_off = _ai(
+        50,
+        "Site-UTC-Offset-Minutes",
+        "Site-local offset from UTC in minutes (zoneinfo)",
+        EngineeringUnits.minutes,
+    )
+    return (
+        csv_dt,
+        csv_tz,
+        csv_date,
+        csv_time,
+        bi_ok,
+        bi_dst,
+        ai_y,
+        ai_mo,
+        ai_d,
+        ai_h,
+        ai_mi,
+        ai_s,
+        ai_wd,
+        ai_off,
     )
 
 
@@ -1578,6 +1741,20 @@ class BacnetPypesClient:
         self._ai_aq_uv: Optional[AnalogInputObject] = None
         self._bi_aq_ok: Optional[BinaryInputObject] = None
         self._csv_aq_last: Optional[_EdgeCharacterStringValue] = None
+        self._csv_site_local_dt: Optional[_EdgeCharacterStringValue] = None
+        self._csv_site_tz: Optional[_EdgeCharacterStringValue] = None
+        self._csv_site_date: Optional[_EdgeCharacterStringValue] = None
+        self._csv_site_time: Optional[_EdgeCharacterStringValue] = None
+        self._bi_site_time_ok: Optional[BinaryInputObject] = None
+        self._bi_site_dst: Optional[BinaryInputObject] = None
+        self._ai_site_year: Optional[AnalogInputObject] = None
+        self._ai_site_month: Optional[AnalogInputObject] = None
+        self._ai_site_day: Optional[AnalogInputObject] = None
+        self._ai_site_hour: Optional[AnalogInputObject] = None
+        self._ai_site_minute: Optional[AnalogInputObject] = None
+        self._ai_site_second: Optional[AnalogInputObject] = None
+        self._ai_site_weekday: Optional[AnalogInputObject] = None
+        self._ai_site_utc_offset_min: Optional[AnalogInputObject] = None
         self._iam_response_effective: str = "unicast"
 
     def _build_application(self) -> Application:
@@ -1727,6 +1904,53 @@ class BacnetPypesClient:
         self._ai_aq_uv = ai_aq_uv
         self._bi_aq_ok = bi_aq_ok
         self._csv_aq_last = csv_aq
+        (
+            csv_site_dt,
+            csv_site_tz,
+            csv_site_date,
+            csv_site_time,
+            bi_site_ok,
+            bi_site_dst,
+            ai_site_y,
+            ai_site_mo,
+            ai_site_d,
+            ai_site_h,
+            ai_site_mi,
+            ai_site_s,
+            ai_site_wd,
+            ai_site_off,
+        ) = _create_site_time_objects()
+        for o in (
+            csv_site_dt,
+            csv_site_tz,
+            csv_site_date,
+            csv_site_time,
+            bi_site_ok,
+            bi_site_dst,
+            ai_site_y,
+            ai_site_mo,
+            ai_site_d,
+            ai_site_h,
+            ai_site_mi,
+            ai_site_s,
+            ai_site_wd,
+            ai_site_off,
+        ):
+            app.add_object(o)
+        self._csv_site_local_dt = csv_site_dt
+        self._csv_site_tz = csv_site_tz
+        self._csv_site_date = csv_site_date
+        self._csv_site_time = csv_site_time
+        self._bi_site_time_ok = bi_site_ok
+        self._bi_site_dst = bi_site_dst
+        self._ai_site_year = ai_site_y
+        self._ai_site_month = ai_site_mo
+        self._ai_site_day = ai_site_d
+        self._ai_site_hour = ai_site_h
+        self._ai_site_minute = ai_site_mi
+        self._ai_site_second = ai_site_s
+        self._ai_site_weekday = ai_site_wd
+        self._ai_site_utc_offset_min = ai_site_off
         self._iam_response_effective = self._effective.iam_response_mode
         _patch_whois_iam_response(app, self._iam_response_effective)
         return app
@@ -1896,6 +2120,51 @@ class BacnetPypesClient:
             err = (result.error or "fetch_failed").strip() or "fetch_failed"
             self._csv_aq_last.presentValue = CharacterString(_truncate_csv_text(f"err {err}"))
 
+    def update_site_time(self, info: SiteLocalTimeInfo) -> None:
+        """Update site-local time BACnet points; on failure only clears OK/DST (preserves last strings/values)."""
+        if (
+            self._csv_site_local_dt is None
+            or self._csv_site_tz is None
+            or self._csv_site_date is None
+            or self._csv_site_time is None
+            or self._bi_site_time_ok is None
+            or self._bi_site_dst is None
+            or self._ai_site_year is None
+            or self._ai_site_month is None
+            or self._ai_site_day is None
+            or self._ai_site_hour is None
+            or self._ai_site_minute is None
+            or self._ai_site_second is None
+            or self._ai_site_weekday is None
+            or self._ai_site_utc_offset_min is None
+        ):
+            return
+        if not info.ok:
+            self._bi_site_time_ok.presentValue = BinaryPV.inactive
+            self._bi_site_dst.presentValue = BinaryPV.inactive
+            return
+        self._bi_site_time_ok.presentValue = BinaryPV.active
+        self._bi_site_dst.presentValue = BinaryPV.active if info.is_dst else BinaryPV.inactive
+        tz_label = (info.timezone_name or "").strip() or "unknown"
+        self._csv_site_tz.presentValue = CharacterString(_truncate_csv_text(tz_label, 256))
+        self._csv_site_local_dt.presentValue = CharacterString(
+            _truncate_csv_text(info.local_datetime_iso, 400)
+        )
+        self._csv_site_date.presentValue = CharacterString(
+            _truncate_csv_text(info.local_date_iso, 32)
+        )
+        self._csv_site_time.presentValue = CharacterString(
+            _truncate_csv_text(info.local_time_iso, 32)
+        )
+        self._ai_site_year.presentValue = Real(float(info.year))
+        self._ai_site_month.presentValue = Real(float(info.month))
+        self._ai_site_day.presentValue = Real(float(info.day))
+        self._ai_site_hour.presentValue = Real(float(info.hour))
+        self._ai_site_minute.presentValue = Real(float(info.minute))
+        self._ai_site_second.presentValue = Real(float(info.second))
+        self._ai_site_weekday.presentValue = Real(float(info.weekday_number))
+        self._ai_site_utc_offset_min.presentValue = Real(float(info.utc_offset_minutes))
+
     async def start(self) -> None:
         if self._app is not None:
             return
@@ -1960,6 +2229,20 @@ class BacnetPypesClient:
         self._ai_aq_uv = None
         self._bi_aq_ok = None
         self._csv_aq_last = None
+        self._csv_site_local_dt = None
+        self._csv_site_tz = None
+        self._csv_site_date = None
+        self._csv_site_time = None
+        self._bi_site_time_ok = None
+        self._bi_site_dst = None
+        self._ai_site_year = None
+        self._ai_site_month = None
+        self._ai_site_day = None
+        self._ai_site_hour = None
+        self._ai_site_minute = None
+        self._ai_site_second = None
+        self._ai_site_weekday = None
+        self._ai_site_utc_offset_min = None
 
     async def restart(self, effective: EffectiveBacnetConfig) -> None:
         await self.stop()

@@ -91,6 +91,13 @@ class RemoteAgentTuning(BaseModel):
             "weatherPollingEnabled",
         ),
     )
+    site_time_poll_interval_seconds: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "site_time_poll_interval_seconds",
+            "siteTimePollIntervalSeconds",
+        ),
+    )
 
 
 def weather_coords_valid(lat: Optional[float], lon: Optional[float]) -> bool:

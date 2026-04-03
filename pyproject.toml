@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "edge-agent"
-version = "0.1.11"
+version = "0.1.12"
 description = "BACnet/IP edge agent — polls SaaS, runs BACnet jobs"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,6 +13,7 @@ dependencies = [
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
     "bacpypes3>=0.0.104",
+    "timezonefinder>=6.2",
 ]
 
 [project.optional-dependencies]

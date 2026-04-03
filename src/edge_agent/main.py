@@ -29,6 +29,7 @@ from edge_agent.open_meteo import fetch_current_weather
 from edge_agent.open_meteo_air_quality import fetch_current_air_quality
 from edge_agent.saas_client import SaasClient
 from edge_agent.settings import Settings
+from edge_agent.site_time import get_local_time_info
 from edge_agent.storage import Storage
 
 _log = logging.getLogger(__name__)
@@ -274,6 +275,27 @@ async def _run_forever(settings: Settings) -> None:
                 )
             )
 
+    async def site_time_task() -> None:
+        """Site-local time from system UTC + offline IANA zone (weather_latitude/longitude)."""
+        while True:
+            tuning = storage.get_remote_agent_tuning()
+            interval = apply_float_tuning(
+                settings.site_time_poll_interval_seconds,
+                tuning,
+                "site_time_poll_interval_seconds",
+                30.0,
+                3600.0,
+            )
+            try:
+                if isinstance(bacnet, BacnetPypesClient):
+                    lat = tuning.weather_latitude if tuning else None
+                    lon = tuning.weather_longitude if tuning else None
+                    info = get_local_time_info(lat, lon)
+                    bacnet.update_site_time(info)
+            except Exception as e:
+                _log.warning("site_time_update_failed err=%s", e)
+            await asyncio.sleep(interval)
+
     async def config_task() -> None:
         while True:
             await asyncio.sleep(
@@ -345,6 +367,7 @@ async def _run_forever(settings: Settings) -> None:
             job_task(),
             edge_status_task(),
             weather_poll_task(),
+            site_time_task(),
         )
     finally:
         await _stop_bacnet(bacnet)
