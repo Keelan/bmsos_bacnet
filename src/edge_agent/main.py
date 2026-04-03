@@ -148,6 +148,11 @@ async def _apply_remote_config(
             cfg.revision,
         )
         await bacnet.restart(eff_after)
+        bacnet.set_agent_identity_csv(
+            socket.gethostname(),
+            settings.box_id,
+            settings.saas_base,
+        )
         bacnet.set_weather_polling_enabled_from_config(storage.get_remote_agent_tuning())
 
 
