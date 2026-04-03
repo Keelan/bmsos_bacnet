@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+import types
 from importlib.metadata import PackageNotFoundError, version as package_version
 from typing import Any, Optional, Union
 
@@ -22,6 +23,7 @@ from bacpypes3.apdu import (
     SimpleAckPDU,
 )
 from bacpypes3.app import Application
+from bacpypes3.errors import MissingRequiredParameter, ParameterOutOfRange
 from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.basetypes import (
     BinaryPV,
@@ -56,6 +58,48 @@ _JOB_MSI_RUNNING = 2
 _JOB_MSI_SUCCESS = 3
 _JOB_MSI_PARTIAL = 4
 _JOB_MSI_FAILED = 5
+
+
+def _patch_whois_iam_response(app: Application, mode: str) -> None:
+    """
+    BACpypes3 ``WhoIsIAmServices.do_WhoIsRequest`` calls ``self.i_am(address=apdu.pduSource)``
+    (Original-Unicast-NPDU to the requester). Some tools expect I-Am as a **broadcast**
+    (Original-Broadcast-NPDU / BVLC 0x0b on IPv4).
+
+    ``i_am(address=None)`` uses ``GlobalBroadcast``; NetworkServiceAccessPoint maps that to
+    ``LocalBroadcast`` for the local adapter, which BIPNormal encodes as OriginalBroadcastNPDU.
+    """
+    if mode == "unicast":
+        return
+
+    async def do_WhoIsRequest(self, apdu) -> None:
+        if not self.device_object:
+            return
+
+        low_limit = apdu.deviceInstanceRangeLowLimit
+        high_limit = apdu.deviceInstanceRangeHighLimit
+
+        if low_limit is not None:
+            if high_limit is None:
+                raise MissingRequiredParameter("deviceInstanceRangeHighLimit required")
+            if (low_limit < 0) or (low_limit > 4194303):
+                raise ParameterOutOfRange("deviceInstanceRangeLowLimit out of range")
+        if high_limit is not None:
+            if low_limit is None:
+                raise MissingRequiredParameter("deviceInstanceRangeLowLimit required")
+            if (high_limit < 0) or (high_limit > 4194303):
+                raise ParameterOutOfRange("deviceInstanceRangeHighLimit out of range")
+
+        if low_limit is not None:
+            if self.device_object.objectIdentifier[1] < low_limit:
+                return
+        if high_limit is not None:
+            if self.device_object.objectIdentifier[1] > high_limit:
+                return
+
+        self.i_am(address=None)
+
+    app.do_WhoIsRequest = types.MethodType(do_WhoIsRequest, app)  # type: ignore[method-assign]
 
 
 class _EdgeCharacterStringValue(LocalObject, _CharacterStringValueObject):
@@ -1037,6 +1081,7 @@ class BacnetPypesClient:
         self._csv_saas_base: Optional[_EdgeCharacterStringValue] = None
         self._csv_last_job: Optional[_EdgeCharacterStringValue] = None
         self._msi_last_job: Optional[_EdgeMultiStateInput] = None
+        self._iam_response_effective: str = "unicast"
 
     def _build_application(self) -> Application:
         # BACpypes3 snapshots BACPYPES_* from os.environ when bacpypes3.argparse is
@@ -1084,6 +1129,8 @@ class BacnetPypesClient:
         self._csv_saas_base = csv_saas
         self._csv_last_job = csv_job
         self._msi_last_job = msi_job
+        self._iam_response_effective = self._settings.bacnet_iam_response_mode
+        _patch_whois_iam_response(app, self._iam_response_effective)
         return app
 
     def update_edge_status_binary_inputs(self, internet_ok: bool, saas_ok: bool) -> None:
@@ -1145,10 +1192,11 @@ class BacnetPypesClient:
             else "(default host)"
         )
         _log.info(
-            "bacnet_stack_started name=%s device_instance=%s address=%s",
+            "bacnet_stack_started name=%s device_instance=%s address=%s whois_iam=%s",
             self._effective.device_name,
             self._effective.device_instance,
             addr_log,
+            self._iam_response_effective,
         )
 
     async def stop(self) -> None:

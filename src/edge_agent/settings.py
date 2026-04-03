@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Any, Literal
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,7 +39,20 @@ class Settings(BaseSettings):
     # Device object vendor-name (BACnet property vendor-name).
     bacnet_vendor_name: str = "bmsOS"
     bacnet_vendor_identifier: int = 999
+    # Who-Is handling: "unicast" = I-Am back to requester (BACpypes default); "broadcast" =
+    # I-Am to GlobalBroadcast (mapped to subnet broadcast / Original-Broadcast-NPDU on IPv4).
+    bacnet_iam_response_mode: Literal["unicast", "broadcast"] = "unicast"
     bacnet_mock: bool = False
+
+    @field_validator("bacnet_iam_response_mode", mode="before")
+    @classmethod
+    def _coerce_iam_response_mode(cls, v: Any) -> str:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return "unicast"
+        s = str(v).strip().lower()
+        if s in ("unicast", "broadcast"):
+            return s
+        return "unicast"
 
     software_version: str = "0.1.6"
     who_is_timeout_seconds: float = 5.0

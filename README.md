@@ -37,6 +37,7 @@ Inspect results: `curl -s http://127.0.0.1:8765/dev/results | jq`.
 - Set `BACNET_MOCK=false`.
 - Set `BACNET_BIND_IP` to the interface IPv4 on the BACnet LAN.
 - Set `BACNET_BIND_PREFIX` (e.g. `24`) so the stack binds as `ip/24:47808`. **Bare `ip:port` is treated as /32 by BACpypes3 and breaks Who-Is** (`RuntimeError: no broadcast`). Alternatively put CIDR in `BACNET_BIND_IP` (e.g. `192.168.1.5/24`).
+- Optional: `BACNET_IAM_RESPONSE_MODE=broadcast` so Who-Is is answered with a **broadcast** I-Am (BVLC Original-Broadcast-NPDU) instead of unicasting back to the requester—needed for some discovery tools (e.g. YABE on certain networks). Default is `unicast`.
 
 ## Update on a staging / production device
 
