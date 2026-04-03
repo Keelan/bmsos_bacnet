@@ -47,6 +47,12 @@ from bacpypes3.pdu import Address, LocalBroadcast
 from bacpypes3.primitivedata import Boolean, CharacterString, Null, ObjectIdentifier, Real, Unsigned
 
 from edge_agent.json_safe import failure_message, to_json_safe
+from edge_agent.weather_derived import (
+    dew_point_celsius,
+    heat_index_display,
+    wind_chill_display,
+    wmo_weather_code_text,
+)
 from edge_agent.models import (
     EffectiveBacnetConfig,
     JobResultEnvelope,
@@ -175,6 +181,14 @@ def _set_binary_if_changed(obj: BinaryInputObject, pv: BinaryPV) -> None:
     if obj.presentValue == pv:
         return
     obj.presentValue = pv
+
+
+def _set_multistate_if_changed(obj: _EdgeMultiStateInput, state: int) -> None:
+    """Multi-state present value is 1..N matching stateText order."""
+    u = Unsigned(int(state))
+    if obj.presentValue == u:
+        return
+    obj.presentValue = u
 
 
 def _create_agent_telemetry_objects() -> tuple[
@@ -326,7 +340,8 @@ def _create_weather_objects(
     _EdgeCharacterStringValue,
 ]:
     """
-    Forecast weather points (Open-Meteo ``current``). Instance block AI 2–15; BI 3–4,6; BV 1; CSV 5.
+    Forecast weather points (Open-Meteo ``current``).     Instance block AI 2–15 (raw Open-Meteo); BI 3–4,6; BV 1; CSV 5.
+    Derived dew point / heat index / wind chill + code text: see ``_create_weather_derived_objects`` (AI 16–18, CSV 11).
     Metric: km/h wind, mm precip/rain/showers, cm snow, hPa pressure. Imperial: mph, in, in snow, inHg.
     """
     zf = StatusFlags([0, 0, 0, 0])
@@ -560,6 +575,69 @@ def _create_weather_objects(
     )
 
 
+def _create_weather_derived_objects(
+    tuning: Optional[RemoteAgentTuning],
+) -> tuple[AnalogInputObject, AnalogInputObject, AnalogInputObject, _EdgeCharacterStringValue]:
+    """
+    Derived outdoor metrics from the same Open-Meteo ``current`` payload (computed locally).
+
+    Instance reservation:
+      - analog-input 16–18: dew point, heat index, wind chill (engineering units match
+        Weather-OutdoorTemp: °C metric, °F imperial).
+      - characterstringValue 11: WMO weather code description (numeric code remains AI 10).
+
+    Gap AI 19–33 reserved for future weather-related analogs (site time uses 43+).
+    """
+    zf = StatusFlags([0, 0, 0, 0])
+    common = {
+        "statusFlags": zf,
+        "eventState": EventState.normal,
+        "outOfService": Boolean(False),
+    }
+    temp_units = _weather_temp_engineering_units(tuning)
+    ai_dew = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,16"),
+        objectName=CharacterString("Weather-DewPoint"),
+        description=CharacterString(
+            "Dew point from T/RH (Magnus); same °F/°C mode as outdoor temperature"
+        ),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=temp_units,
+        **common,
+    )
+    ai_hi = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,17"),
+        objectName=CharacterString("Weather-HeatIndex"),
+        description=CharacterString(
+            "NWS heat index when T≥80 °F; else dry-bulb (see weather_derived)"
+        ),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=temp_units,
+        **common,
+    )
+    ai_wc = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,18"),
+        objectName=CharacterString("Weather-WindChill"),
+        description=CharacterString(
+            "Wind chill (NWS mph / Canada km/h); else dry-bulb when out of range"
+        ),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=temp_units,
+        **common,
+    )
+    csv_code = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,11"),
+        objectName=CharacterString("Weather-Code-Text"),
+        description=CharacterString("WMO weather code short label (Open-Meteo)"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    return ai_dew, ai_hi, ai_wc, csv_code
+
+
 def _create_air_quality_objects() -> tuple[
     AnalogInputObject,
     AnalogInputObject,
@@ -650,7 +728,7 @@ def _create_air_quality_objects() -> tuple[
     )
     ai_aod = _ai(
         41,
-        "Outdoor-AOD",
+        "Outdoor-AerosolOpticalDepth",
         "Aerosol optical depth at 550 nm (dimensionless)",
         EngineeringUnits.noUnits,
         0.01,
@@ -711,17 +789,19 @@ def _create_site_time_objects() -> tuple[
     AnalogInputObject,
     AnalogInputObject,
     AnalogInputObject,
+    _EdgeMultiStateInput,
     AnalogInputObject,
 ]:
     """
     Site-local time from system UTC + IANA zone resolved offline from weather lat/lon.
 
     Instance reservation (no overlap with telemetry CSV 1–4, weather CSV 5, AQ CSV 6,
-    weather BI 3–4,6, AQ BI 5, edge BI 1–2, weather AI 2–15, AQ AI 34–42):
+    weather BI 3–4,6, AQ BI 5, edge BI 1–2, weather AI 2–15, weather derived AI 16–18, AQ AI 34–42):
 
     - characterstringValue 7–10: datetime / timezone / date / time strings
     - binary-input 7–8: Site-Time-OK, Site-DST-Active
     - analog-input 43–50: calendar components + UTC offset minutes
+    - multiStateInput 2: Site-Weekday (state 1–7 = ISO Monday–Sunday; same as Site-Weekday-Number AI)
     """
     zf = StatusFlags([0, 0, 0, 0])
     common = {
@@ -835,6 +915,28 @@ def _create_site_time_objects() -> tuple[
         "ISO weekday 1=Monday … 7=Sunday (dimensionless)",
         EngineeringUnits.noUnits,
     )
+    st_weekday = ArrayOf(StateTextString)(
+        [
+            StateTextString("Monday"),
+            StateTextString("Tuesday"),
+            StateTextString("Wednesday"),
+            StateTextString("Thursday"),
+            StateTextString("Friday"),
+            StateTextString("Saturday"),
+            StateTextString("Sunday"),
+        ]
+    )
+    msi_wd = _EdgeMultiStateInput(
+        objectIdentifier=ObjectIdentifier("multiStateInput,2"),
+        objectName=CharacterString("Site-Weekday"),
+        description=CharacterString(
+            "Site-local weekday (state text); present value 1–7 = ISO Monday–Sunday (same as analog Site-Weekday-Number)"
+        ),
+        presentValue=Unsigned(1),
+        numberOfStates=Unsigned(7),
+        stateText=st_weekday,
+        **common,
+    )
     ai_off = _ai(
         50,
         "Site-UTC-Offset-Minutes",
@@ -855,6 +957,7 @@ def _create_site_time_objects() -> tuple[
         ai_mi,
         ai_s,
         ai_wd,
+        msi_wd,
         ai_off,
     )
 
@@ -1763,6 +1866,10 @@ class BacnetPypesClient:
         self._bi_weather_is_day: Optional[BinaryInputObject] = None
         self._bv_weather_polling: Optional[BinaryValueObject] = None
         self._csv_weather_last: Optional[_EdgeCharacterStringValue] = None
+        self._ai_weather_dew: Optional[AnalogInputObject] = None
+        self._ai_weather_heat_index: Optional[AnalogInputObject] = None
+        self._ai_weather_wind_chill: Optional[AnalogInputObject] = None
+        self._csv_weather_code_text: Optional[_EdgeCharacterStringValue] = None
         self._ai_aq_co2: Optional[AnalogInputObject] = None
         self._ai_aq_pm25: Optional[AnalogInputObject] = None
         self._ai_aq_pm10: Optional[AnalogInputObject] = None
@@ -1787,6 +1894,7 @@ class BacnetPypesClient:
         self._ai_site_minute: Optional[AnalogInputObject] = None
         self._ai_site_second: Optional[AnalogInputObject] = None
         self._ai_site_weekday: Optional[AnalogInputObject] = None
+        self._msi_site_weekday: Optional[_EdgeMultiStateInput] = None
         self._ai_site_utc_offset_min: Optional[AnalogInputObject] = None
         self._iam_response_effective: str = "unicast"
 
@@ -1899,6 +2007,13 @@ class BacnetPypesClient:
         self._bi_weather_is_day = bi_wx_day
         self._bv_weather_polling = bv_wx_poll
         self._csv_weather_last = csv_wx
+        ai_wx_dew, ai_wx_hi, ai_wx_wc, csv_wx_code = _create_weather_derived_objects(wx_tuning)
+        for o in (ai_wx_dew, ai_wx_hi, ai_wx_wc, csv_wx_code):
+            app.add_object(o)
+        self._ai_weather_dew = ai_wx_dew
+        self._ai_weather_heat_index = ai_wx_hi
+        self._ai_weather_wind_chill = ai_wx_wc
+        self._csv_weather_code_text = csv_wx_code
         (
             ai_aq_co2,
             ai_aq_pm25,
@@ -1951,6 +2066,7 @@ class BacnetPypesClient:
             ai_site_mi,
             ai_site_s,
             ai_site_wd,
+            msi_site_wd,
             ai_site_off,
         ) = _create_site_time_objects()
         for o in (
@@ -1967,6 +2083,7 @@ class BacnetPypesClient:
             ai_site_mi,
             ai_site_s,
             ai_site_wd,
+            msi_site_wd,
             ai_site_off,
         ):
             app.add_object(o)
@@ -1983,6 +2100,7 @@ class BacnetPypesClient:
         self._ai_site_minute = ai_site_mi
         self._ai_site_second = ai_site_s
         self._ai_site_weekday = ai_site_wd
+        self._msi_site_weekday = msi_site_wd
         self._ai_site_utc_offset_min = ai_site_off
         self._iam_response_effective = self._effective.iam_response_mode
         _patch_whois_iam_response(app, self._iam_response_effective)
@@ -2070,8 +2188,13 @@ class BacnetPypesClient:
             or self._bi_weather_unit_of_measure is None
             or self._bi_weather_is_day is None
             or self._csv_weather_last is None
+            or self._ai_weather_dew is None
+            or self._ai_weather_heat_index is None
+            or self._ai_weather_wind_chill is None
+            or self._csv_weather_code_text is None
         ):
             return
+        imperial_bundle = use_fahrenheit
         self._bi_weather_unit_of_measure.presentValue = (
             BinaryPV.active if use_fahrenheit else BinaryPV.inactive
         )
@@ -2106,6 +2229,28 @@ class BacnetPypesClient:
                 BinaryPV.active if result.is_day else BinaryPV.inactive
             )
             self._bi_weather_ok.presentValue = BinaryPV.active
+            dew_c = dew_point_celsius(t_c, result.humidity_percent)
+            dew_disp = (dew_c * 9.0 / 5.0 + 32.0) if use_fahrenheit else dew_c
+            self._ai_weather_dew.presentValue = Real(float(dew_disp))
+            self._ai_weather_heat_index.presentValue = Real(
+                float(heat_index_display(t_c, result.humidity_percent, use_fahrenheit))
+            )
+            self._ai_weather_wind_chill.presentValue = Real(
+                float(
+                    wind_chill_display(
+                        t_c,
+                        float(result.wind_speed),
+                        imperial_bundle=imperial_bundle,
+                        use_fahrenheit=use_fahrenheit,
+                    )
+                )
+            )
+            self._csv_weather_code_text.presentValue = CharacterString(
+                _truncate_csv_text(
+                    wmo_weather_code_text(int(result.weather_code)),
+                    128,
+                )
+            )
             self._csv_weather_last.presentValue = CharacterString(
                 _truncate_csv_text(
                     f"ok code={result.weather_code} t_c={t_c:.2f} rh={result.humidity_percent:.1f}"
@@ -2169,6 +2314,7 @@ class BacnetPypesClient:
             or self._ai_site_minute is None
             or self._ai_site_second is None
             or self._ai_site_weekday is None
+            or self._msi_site_weekday is None
             or self._ai_site_utc_offset_min is None
         ):
             return
@@ -2193,6 +2339,7 @@ class BacnetPypesClient:
         _set_real_if_changed(self._ai_site_minute, float(info.minute))
         _set_real_if_changed(self._ai_site_second, float(info.second))
         _set_real_if_changed(self._ai_site_weekday, float(info.weekday_number))
+        _set_multistate_if_changed(self._msi_site_weekday, info.weekday_number)
         _set_real_if_changed(self._ai_site_utc_offset_min, float(info.utc_offset_minutes))
 
     async def start(self) -> None:
@@ -2248,6 +2395,10 @@ class BacnetPypesClient:
         self._bi_weather_is_day = None
         self._bv_weather_polling = None
         self._csv_weather_last = None
+        self._ai_weather_dew = None
+        self._ai_weather_heat_index = None
+        self._ai_weather_wind_chill = None
+        self._csv_weather_code_text = None
         self._ai_aq_co2 = None
         self._ai_aq_pm25 = None
         self._ai_aq_pm10 = None
@@ -2272,6 +2423,7 @@ class BacnetPypesClient:
         self._ai_site_minute = None
         self._ai_site_second = None
         self._ai_site_weekday = None
+        self._msi_site_weekday = None
         self._ai_site_utc_offset_min = None
 
     async def restart(self, effective: EffectiveBacnetConfig) -> None:

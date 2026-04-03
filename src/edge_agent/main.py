@@ -261,6 +261,7 @@ async def _run_forever(settings: Settings) -> None:
                         ),
                         fetch_current_air_quality(lat, lon, timeout_seconds=tmo),
                     )
+                    # Each updater keeps last good analogs when its fetch fails (partial success).
                     bacnet.update_weather(wx_result, imperial)
                     bacnet.update_air_quality(aq_result)
             except Exception as e:
