@@ -1,0 +1,32 @@
+---
+description: Bump and sync edge-agent package version on every shipping change
+alwaysApply: true
+---
+
+# Edge agent — always bump version
+
+Whenever you change **shipped** code, config, or deploy assets for this repo (`bmsos_bacnet`), **bump the package version** and keep all version strings in sync. Do not leave version drift across files.
+
+## Canonical version
+
+- **`pyproject.toml`** → `[project] version = "x.y.z"` — source of truth for `pip` / wheels.
+
+## Must stay in sync (bump the same `x.y.z`)
+
+| File | What to update |
+|------|----------------|
+| `pyproject.toml` | `version` |
+| `src/edge_agent/settings.py` | `software_version` default |
+| `.env.example` | `SOFTWARE_VERSION=` |
+| `deploy/install-edge-agent.sh` | `SOFTWARE_VERSION="..."` |
+| `src/edge_agent/__init__.py` | Fallback string in `except PackageNotFoundError` (keep equal to current release; primary `__version__` is `importlib.metadata.version("edge-agent")`) |
+
+## Semver habit
+
+- **Patch** (`0.1.7` → `0.1.8`): bugfixes, small behavior changes, docs-only deploy notes if you version the release.
+- **Minor** (`0.1.x` → `0.2.0`): new features, new job types, API contract changes.
+- Bump **at least one segment** on every merge-worthy change so `update-edge-agent.sh` and heartbeat `software_version` reflect a new release.
+
+## Out of scope
+
+- Do not bump version for typo-only edits to unrelated docs if the team agrees — default is **still bump patch** for any agent-facing change.
