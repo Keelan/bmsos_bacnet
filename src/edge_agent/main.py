@@ -268,6 +268,16 @@ def run(settings: Optional[Settings] = None) -> None:
     from edge_agent.logging_setup import setup_logging
 
     setup_logging(s.log_level)
+    _log.info(
+        "edge_agent_config bacnet_mock=%s bacnet_iam_response_mode=%s bacnet_bind_ip=%r",
+        s.bacnet_mock,
+        s.bacnet_iam_response_mode,
+        s.bacnet_bind_ip,
+    )
+    if s.bacnet_mock:
+        _log.warning(
+            "BACNET_MOCK=true: no real BACnet/IP stack — I-Am and discovery will not run on the LAN"
+        )
     try:
         asyncio.run(_run_forever(s))
     except KeyboardInterrupt:

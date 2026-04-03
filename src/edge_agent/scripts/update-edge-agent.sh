@@ -3,6 +3,10 @@
 # SOFTWARE_VERSION in .env. After pip, this file is refreshed from the installed wheel so you
 # do not need to manually copy deploy/update-edge-agent.sh on each release.
 #
+# This script does NOT "git pull" a folder on disk — it runs pip against PIP_INSTALL_SPEC
+# (e.g. git+https://.../bmsos_bacnet.git@main). Your commits must be pushed to that remote
+# branch/tag; then this reinstalls from Git and restarts the service.
+#
 # If this copy is stale (older than the wheel) but pip already upgraded the package, refresh once:
 #   /opt/edge-agent/.venv/bin/python -c "from importlib.resources import files; from pathlib import Path; p=files('edge_agent')/'scripts'/'update-edge-agent.sh'; Path('/opt/edge-agent/update-edge-agent.sh').write_bytes(p.read_bytes())" && chmod 700 /opt/edge-agent/update-edge-agent.sh
 set -euo pipefail
@@ -32,3 +36,8 @@ if [[ -f "$ENV_FILE" ]]; then
   fi
 fi
 systemctl restart edge-agent
+
+VER_INSTALLED="$(/opt/edge-agent/.venv/bin/python -c 'from importlib.metadata import version; print(version("edge-agent"))')"
+echo "update-edge-agent: installed edge-agent==${VER_INSTALLED}; service restarted."
+echo "Verify config / Who-Is patch in logs, e.g.:"
+echo "  journalctl -u edge-agent -n 60 --no-pager | grep -E 'edge_agent_config|bacnet_whois_iam_patch|bacnet_stack_started|bacnet_mock' || true"

@@ -42,7 +42,7 @@ from bacpypes3.local.binary import BinaryInputObject
 from bacpypes3.local.object import Object as LocalObject
 from bacpypes3.object import CharacterStringValueObject as _CharacterStringValueObject
 from bacpypes3.object import MultiStateInputObject as _MultiStateInputObject
-from bacpypes3.pdu import Address
+from bacpypes3.pdu import Address, LocalBroadcast
 from bacpypes3.primitivedata import Boolean, CharacterString, Null, ObjectIdentifier, Real, Unsigned
 
 from edge_agent.json_safe import failure_message, to_json_safe
@@ -72,6 +72,11 @@ def _patch_whois_iam_response(app: Application, mode: str) -> None:
     if mode == "unicast":
         return
 
+    _log.info(
+        "bacnet_whois_iam_patch: enabled — I-Am will use LocalBroadcast "
+        "(BVLC Original-Broadcast-NPDU / 0x0b on IPv4, not unicast to requester)"
+    )
+
     async def do_WhoIsRequest(self, apdu) -> None:
         if not self.device_object:
             return
@@ -97,7 +102,10 @@ def _patch_whois_iam_response(app: Application, mode: str) -> None:
             if self.device_object.objectIdentifier[1] > high_limit:
                 return
 
-        self.i_am(address=None)
+        # Explicit LocalBroadcast → BIPNormal uses OriginalBroadcastNPDU (0x0b).
+        # (i_am(address=None) uses GlobalBroadcast, which NSAP also maps to broadcast;
+        # LocalBroadcast is the direct path some tools expect.)
+        self.i_am(address=LocalBroadcast())
 
     app.do_WhoIsRequest = types.MethodType(do_WhoIsRequest, app)  # type: ignore[method-assign]
 
