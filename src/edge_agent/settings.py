@@ -54,7 +54,7 @@ class Settings(BaseSettings):
             return s
         return "unicast"
 
-    software_version: str = "0.1.8"
+    software_version: str = "0.1.9"
     who_is_timeout_seconds: float = 5.0
     read_device_live_max_objects: int = 500
     read_device_live_timeout_seconds: float = 120.0
@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     saas_online_threshold_seconds: float = 120.0
     internet_check_url: str = "https://www.google.com/generate_204"
     internet_check_timeout_seconds: float = 5.0
+
+    # Weather (Open-Meteo) poll interval when SaaS omits `weather_poll_interval_seconds` (15–60 min).
+    weather_poll_interval_seconds: float = 1800.0
 
     @property
     def saas_base(self) -> str:

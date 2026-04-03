@@ -32,13 +32,14 @@ from bacpypes3.basetypes import (
     EventState,
     ObjectTypesSupported,
     Polarity,
+    PriorityValue,
     PropertyValue,
     StatusFlags,
 )
 from bacpypes3.basetypes import CharacterString as StateTextString
 from bacpypes3.constructeddata import Array, ArrayOf, SequenceOf
 from bacpypes3.local.analog import AnalogInputObject
-from bacpypes3.local.binary import BinaryInputObject
+from bacpypes3.local.binary import BinaryInputObject, BinaryValueObject
 from bacpypes3.local.object import Object as LocalObject
 from bacpypes3.object import CharacterStringValueObject as _CharacterStringValueObject
 from bacpypes3.object import MultiStateInputObject as _MultiStateInputObject
@@ -46,7 +47,15 @@ from bacpypes3.pdu import Address, LocalBroadcast
 from bacpypes3.primitivedata import Boolean, CharacterString, Null, ObjectIdentifier, Real, Unsigned
 
 from edge_agent.json_safe import failure_message, to_json_safe
-from edge_agent.models import EffectiveBacnetConfig, JobResultEnvelope, utc_now_iso
+from edge_agent.models import (
+    EffectiveBacnetConfig,
+    JobResultEnvelope,
+    RemoteAgentTuning,
+    desired_weather_polling_enabled_from_tuning,
+    use_fahrenheit_from_tuning,
+    utc_now_iso,
+)
+from edge_agent.open_meteo import OpenMeteoResult
 from edge_agent.settings import Settings
 from edge_agent.storage import Storage
 
@@ -203,6 +212,129 @@ def _create_agent_telemetry_objects() -> tuple[
         **common,
     )
     return ai_uptime, csv_host, csv_box, csv_saas, csv_job, msi_job
+
+
+def _priority_array_binary_empty() -> Any:
+    return ArrayOf(PriorityValue)([PriorityValue(null=())] * 16)
+
+
+def _weather_temp_engineering_units(tuning: Optional[RemoteAgentTuning]) -> EngineeringUnits:
+    return (
+        EngineeringUnits.degreesFahrenheit
+        if use_fahrenheit_from_tuning(tuning)
+        else EngineeringUnits.degreesCelsius
+    )
+
+
+def _create_weather_objects(
+    tuning: Optional[RemoteAgentTuning],
+) -> tuple[
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryValueObject,
+    _EdgeCharacterStringValue,
+]:
+    zf = StatusFlags([0, 0, 0, 0])
+    common = {
+        "statusFlags": zf,
+        "eventState": EventState.normal,
+        "outOfService": Boolean(False),
+    }
+    temp_units = _weather_temp_engineering_units(tuning)
+    ai_temp = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,2"),
+        objectName=CharacterString("Weather-OutdoorTemp"),
+        description=CharacterString("Outdoor air temperature (from Open-Meteo)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=temp_units,
+        **common,
+    )
+    ai_rh = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,3"),
+        objectName=CharacterString("Weather-Humidity"),
+        description=CharacterString("Relative humidity (%)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(1.0),
+        units=EngineeringUnits.percentRelativeHumidity,
+        **common,
+    )
+    ai_wind = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,4"),
+        objectName=CharacterString("Weather-WindSpeed"),
+        description=CharacterString("Wind speed at 10 m (m/s)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=EngineeringUnits.metersPerSecond,
+        **common,
+    )
+    ai_precip = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,5"),
+        objectName=CharacterString("Weather-Precipitation"),
+        description=CharacterString("Precipitation (mm)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=EngineeringUnits.millimeters,
+        **common,
+    )
+
+    def _bi_wx_common() -> dict[str, Any]:
+        return {
+            "statusFlags": StatusFlags([0, 0, 0, 0]),
+            "eventState": EventState.normal,
+            "outOfService": Boolean(False),
+            "polarity": Polarity.normal,
+            "inactiveText": CharacterString("Offline"),
+            "activeText": CharacterString("Online"),
+        }
+
+    bi_ok = BinaryInputObject(
+        objectIdentifier=ObjectIdentifier("binary-input,3"),
+        objectName=CharacterString("Weather-OK"),
+        presentValue=BinaryPV.inactive,
+        description=CharacterString("Last Open-Meteo fetch succeeded"),
+        **_bi_wx_common(),
+    )
+    bi_unit = BinaryInputObject(
+        objectIdentifier=ObjectIdentifier("binary-input,4"),
+        objectName=CharacterString("Weather-TempUnit"),
+        presentValue=BinaryPV.active if use_fahrenheit_from_tuning(tuning) else BinaryPV.inactive,
+        description=CharacterString("Temperature unit: inactive=Celsius, active=Fahrenheit"),
+        statusFlags=StatusFlags([0, 0, 0, 0]),
+        eventState=EventState.normal,
+        outOfService=Boolean(False),
+        polarity=Polarity.normal,
+        inactiveText=CharacterString("Celsius"),
+        activeText=CharacterString("Fahrenheit"),
+    )
+
+    poll_en = desired_weather_polling_enabled_from_tuning(tuning)
+    poll_pv = BinaryPV.active if poll_en else BinaryPV.inactive
+    bv_poll = BinaryValueObject(
+        objectIdentifier=ObjectIdentifier("binary-value,1"),
+        objectName=CharacterString("Weather-Polling-Enabled"),
+        description=CharacterString("Active= poll weather; inactive= skip (writable; SaaS sets default on config)"),
+        presentValue=poll_pv,
+        priorityArray=_priority_array_binary_empty(),
+        statusFlags=StatusFlags([0, 0, 0, 0]),
+        eventState=EventState.normal,
+        outOfService=Boolean(False),
+        inactiveText=CharacterString("Disabled"),
+        activeText=CharacterString("Enabled"),
+        relinquishDefault=poll_pv,
+    )
+    csv_wx = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,5"),
+        objectName=CharacterString("Weather-LastUpdate"),
+        description=CharacterString("Last successful fetch or last error"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    return ai_temp, ai_rh, ai_wind, ai_precip, bi_ok, bi_unit, bv_poll, csv_wx
 
 
 def format_bacpypes_device_address(bind_ip: str, bind_prefix: int, udp_port: int) -> str:
@@ -1031,6 +1163,7 @@ def _patch_local_device_object_types_supported(app: Application) -> None:
             ots[ObjectTypesSupported.binaryInput] = 1
             ots[ObjectTypesSupported.multiStateInput] = 1
             ots[ObjectTypesSupported.characterstringValue] = 1
+            ots[ObjectTypesSupported.binaryValue] = 1
             ots[ObjectTypesSupported.device] = 1
             ots[ObjectTypesSupported.networkPort] = 1
             return ots
@@ -1089,6 +1222,14 @@ class BacnetPypesClient:
         self._csv_saas_base: Optional[_EdgeCharacterStringValue] = None
         self._csv_last_job: Optional[_EdgeCharacterStringValue] = None
         self._msi_last_job: Optional[_EdgeMultiStateInput] = None
+        self._ai_weather_temp: Optional[AnalogInputObject] = None
+        self._ai_weather_rh: Optional[AnalogInputObject] = None
+        self._ai_weather_wind: Optional[AnalogInputObject] = None
+        self._ai_weather_precip: Optional[AnalogInputObject] = None
+        self._bi_weather_ok: Optional[BinaryInputObject] = None
+        self._bi_weather_temp_unit: Optional[BinaryInputObject] = None
+        self._bv_weather_polling: Optional[BinaryValueObject] = None
+        self._csv_weather_last: Optional[_EdgeCharacterStringValue] = None
         self._iam_response_effective: str = "unicast"
 
     def _build_application(self) -> Application:
@@ -1137,6 +1278,36 @@ class BacnetPypesClient:
         self._csv_saas_base = csv_saas
         self._csv_last_job = csv_job
         self._msi_last_job = msi_job
+        wx_tuning = self._storage.get_remote_agent_tuning()
+        (
+            ai_wx_t,
+            ai_wx_rh,
+            ai_wx_w,
+            ai_wx_p,
+            bi_wx_ok,
+            bi_wx_u,
+            bv_wx_poll,
+            csv_wx,
+        ) = _create_weather_objects(wx_tuning)
+        for o in (
+            ai_wx_t,
+            ai_wx_rh,
+            ai_wx_w,
+            ai_wx_p,
+            bi_wx_ok,
+            bi_wx_u,
+            bv_wx_poll,
+            csv_wx,
+        ):
+            app.add_object(o)
+        self._ai_weather_temp = ai_wx_t
+        self._ai_weather_rh = ai_wx_rh
+        self._ai_weather_wind = ai_wx_w
+        self._ai_weather_precip = ai_wx_p
+        self._bi_weather_ok = bi_wx_ok
+        self._bi_weather_temp_unit = bi_wx_u
+        self._bv_weather_polling = bv_wx_poll
+        self._csv_weather_last = csv_wx
         self._iam_response_effective = self._effective.iam_response_mode
         _patch_whois_iam_response(app, self._iam_response_effective)
         return app
@@ -1186,6 +1357,55 @@ class BacnetPypesClient:
         )
         self._csv_last_job.presentValue = CharacterString(text)
 
+    def set_weather_polling_enabled_from_config(self, tuning: Optional[RemoteAgentTuning]) -> None:
+        """Apply SaaS desired Weather-Polling-Enabled BV (clears priority array so value takes effect)."""
+        if self._bv_weather_polling is None:
+            return
+        en = desired_weather_polling_enabled_from_tuning(tuning)
+        pv = BinaryPV.active if en else BinaryPV.inactive
+        for i in range(16):
+            self._bv_weather_polling.priorityArray[i] = PriorityValue(null=())
+        self._bv_weather_polling.relinquishDefault = pv
+        self._bv_weather_polling.presentValue = pv
+
+    def is_weather_polling_bv_active(self) -> bool:
+        if self._bv_weather_polling is None:
+            return False
+        return self._bv_weather_polling.presentValue == BinaryPV.active
+
+    def update_weather(self, result: OpenMeteoResult, use_fahrenheit: bool) -> None:
+        """Update weather analog/binary inputs and CSV; on failure keep last analog values."""
+        if (
+            self._ai_weather_temp is None
+            or self._ai_weather_rh is None
+            or self._ai_weather_wind is None
+            or self._ai_weather_precip is None
+            or self._bi_weather_ok is None
+            or self._bi_weather_temp_unit is None
+            or self._csv_weather_last is None
+        ):
+            return
+        self._bi_weather_temp_unit.presentValue = (
+            BinaryPV.active if use_fahrenheit else BinaryPV.inactive
+        )
+        if result.fetch_ok:
+            t_c = result.temperature_c
+            t_disp = (t_c * 9.0 / 5.0 + 32.0) if use_fahrenheit else t_c
+            self._ai_weather_temp.presentValue = Real(float(t_disp))
+            self._ai_weather_rh.presentValue = Real(float(result.humidity_percent))
+            self._ai_weather_wind.presentValue = Real(float(result.wind_speed_m_s))
+            self._ai_weather_precip.presentValue = Real(float(result.precipitation_mm))
+            self._bi_weather_ok.presentValue = BinaryPV.active
+            self._csv_weather_last.presentValue = CharacterString(
+                _truncate_csv_text(
+                    f"ok code={result.weather_code} t_c={t_c:.2f} rh={result.humidity_percent:.1f}"
+                )
+            )
+        else:
+            self._bi_weather_ok.presentValue = BinaryPV.inactive
+            err = (result.error or "fetch_failed").strip() or "fetch_failed"
+            self._csv_weather_last.presentValue = CharacterString(_truncate_csv_text(f"err {err}"))
+
     async def start(self) -> None:
         if self._app is not None:
             return
@@ -1200,7 +1420,7 @@ class BacnetPypesClient:
             else "(default host)"
         )
         _log.info(
-            "bacnet_stack_started name=%s device_instance=%s address=%s whois_iam=%s",
+            "bacnet_stack_started name=%s device_instance=%s address=%s iam_response_mode=%s",
             self._effective.device_name,
             self._effective.device_instance,
             addr_log,
@@ -1220,6 +1440,14 @@ class BacnetPypesClient:
         self._csv_saas_base = None
         self._csv_last_job = None
         self._msi_last_job = None
+        self._ai_weather_temp = None
+        self._ai_weather_rh = None
+        self._ai_weather_wind = None
+        self._ai_weather_precip = None
+        self._bi_weather_ok = None
+        self._bi_weather_temp_unit = None
+        self._bv_weather_polling = None
+        self._csv_weather_last = None
 
     async def restart(self, effective: EffectiveBacnetConfig) -> None:
         await self.stop()

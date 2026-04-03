@@ -30,6 +30,8 @@ class RemoteBacnetConfig(BaseModel):
 class RemoteAgentTuning(BaseModel):
     """Optional SaaS `agent` JSON — overrides env defaults until next config push."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     poll_interval_seconds: Optional[float] = None
     heartbeat_interval_seconds: Optional[float] = None
     config_poll_interval_seconds: Optional[float] = None
@@ -37,6 +39,69 @@ class RemoteAgentTuning(BaseModel):
     who_is_timeout_seconds: Optional[float] = None
     read_device_live_max_objects: Optional[int] = None
     read_device_live_timeout_seconds: Optional[float] = None
+
+    weather_enabled: Optional[bool] = Field(
+        default=None,
+        validation_alias=AliasChoices("weather_enabled", "weatherEnabled"),
+    )
+    weather_latitude: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices("weather_latitude", "weatherLatitude"),
+    )
+    weather_longitude: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices("weather_longitude", "weatherLongitude"),
+    )
+    weather_temperature_unit: Optional[Literal["celsius", "fahrenheit"]] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "weather_temperature_unit",
+            "weatherTemperatureUnit",
+        ),
+    )
+    weather_poll_interval_seconds: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "weather_poll_interval_seconds",
+            "weatherPollIntervalSeconds",
+        ),
+    )
+    weather_polling_enabled: Optional[bool] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "weather_polling_enabled",
+            "weatherPollingEnabled",
+        ),
+    )
+
+
+def weather_coords_valid(lat: Optional[float], lon: Optional[float]) -> bool:
+    if lat is None or lon is None:
+        return False
+    try:
+        la = float(lat)
+        lo = float(lon)
+    except (TypeError, ValueError):
+        return False
+    return -90.0 <= la <= 90.0 and -180.0 <= lo <= 180.0
+
+
+def remote_weather_master_enabled(tuning: Optional[RemoteAgentTuning]) -> bool:
+    """True when SaaS enables weather and lat/lon are valid."""
+    if tuning is None or tuning.weather_enabled is not True:
+        return False
+    return weather_coords_valid(tuning.weather_latitude, tuning.weather_longitude)
+
+
+def use_fahrenheit_from_tuning(tuning: Optional[RemoteAgentTuning]) -> bool:
+    return tuning is not None and tuning.weather_temperature_unit == "fahrenheit"
+
+
+def desired_weather_polling_enabled_from_tuning(tuning: Optional[RemoteAgentTuning]) -> bool:
+    """SaaS default for Weather-Polling-Enabled BV when key absent: allow polling."""
+    if tuning is None or tuning.weather_polling_enabled is None:
+        return True
+    return bool(tuning.weather_polling_enabled)
 
 
 class ConfigPullResponse(BaseModel):
