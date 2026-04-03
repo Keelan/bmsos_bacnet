@@ -58,6 +58,7 @@ def _load_effective(settings: Settings, storage: Storage):
         settings.bacnet_device_name,
         settings.bacnet_bind_prefix,
         settings.bacnet_vendor_identifier,
+        settings.bacnet_iam_response_mode,
         remote,
     )
 

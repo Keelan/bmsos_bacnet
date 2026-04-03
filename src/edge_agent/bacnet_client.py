@@ -1137,7 +1137,7 @@ class BacnetPypesClient:
         self._csv_saas_base = csv_saas
         self._csv_last_job = csv_job
         self._msi_last_job = msi_job
-        self._iam_response_effective = self._settings.bacnet_iam_response_mode
+        self._iam_response_effective = self._effective.iam_response_mode
         _patch_whois_iam_response(app, self._iam_response_effective)
         return app
 

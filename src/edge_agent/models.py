@@ -19,6 +19,12 @@ class RemoteBacnetConfig(BaseModel):
     # IP subnet prefix for bind (e.g. 24); required for broadcast Who-Is on many networks.
     bind_prefix: Optional[int] = None
     vendor_identifier: Optional[int] = None
+    # True = broadcast I-Am (BVLC Original-Broadcast-NPDU); False = unicast to requester.
+    # Omit/null = use agent env `BACNET_IAM_RESPONSE_MODE`.
+    iam_response_broadcast: Optional[bool] = Field(
+        default=None,
+        validation_alias=AliasChoices("iam_response_broadcast", "iamResponseBroadcast"),
+    )
 
 
 class RemoteAgentTuning(BaseModel):
@@ -48,6 +54,12 @@ class EffectiveBacnetConfig(BaseModel):
     device_name: str
     bind_prefix: int
     vendor_identifier: int
+    iam_response_mode: Literal["unicast", "broadcast"] = "unicast"
+
+
+def _iam_mode_from_settings_env(raw: str) -> Literal["unicast", "broadcast"]:
+    s = (raw or "unicast").strip().lower()
+    return "broadcast" if s == "broadcast" else "unicast"
 
 
 def merge_bacnet(
@@ -57,6 +69,7 @@ def merge_bacnet(
     settings_device_name: str,
     settings_bind_prefix: int,
     settings_vendor_identifier: int,
+    settings_iam_response_mode: str,
     remote: Optional[RemoteBacnetConfig],
 ) -> EffectiveBacnetConfig:
     eff = EffectiveBacnetConfig(
@@ -66,6 +79,7 @@ def merge_bacnet(
         device_name=settings_device_name.strip() or "Excelsior",
         bind_prefix=int(settings_bind_prefix),
         vendor_identifier=int(settings_vendor_identifier),
+        iam_response_mode=_iam_mode_from_settings_env(settings_iam_response_mode),
     )
     if not remote:
         return eff
@@ -82,6 +96,10 @@ def merge_bacnet(
         eff.bind_prefix = int(remote.bind_prefix)
     if remote.vendor_identifier is not None:
         eff.vendor_identifier = int(remote.vendor_identifier)
+    if remote.iam_response_broadcast is not None:
+        eff.iam_response_mode = (
+            "broadcast" if remote.iam_response_broadcast else "unicast"
+        )
     return eff
 
 
