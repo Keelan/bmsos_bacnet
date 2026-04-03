@@ -226,6 +226,32 @@ def _weather_temp_engineering_units(tuning: Optional[RemoteAgentTuning]) -> Engi
     )
 
 
+def _weather_imperial_bundle(tuning: Optional[RemoteAgentTuning]) -> bool:
+    """True when SaaS selects US/imperial: F, mph, inches (same flag as temperature)."""
+    return use_fahrenheit_from_tuning(tuning)
+
+
+def _weather_wind_engineering_units(tuning: Optional[RemoteAgentTuning]) -> EngineeringUnits:
+    return (
+        EngineeringUnits.milesPerHour
+        if _weather_imperial_bundle(tuning)
+        else EngineeringUnits.metersPerSecond
+    )
+
+
+def _weather_precip_engineering_units(tuning: Optional[RemoteAgentTuning]) -> EngineeringUnits:
+    return (
+        EngineeringUnits.inches
+        if _weather_imperial_bundle(tuning)
+        else EngineeringUnits.millimeters
+    )
+
+
+# m/s → mph; mm → inches (25.4 mm per inch)
+_MS_TO_MPH = 2.2369362920544025
+_MM_TO_IN = 1.0 / 25.4
+
+
 def _create_weather_objects(
     tuning: Optional[RemoteAgentTuning],
 ) -> tuple[
@@ -263,22 +289,30 @@ def _create_weather_objects(
         units=EngineeringUnits.percentRelativeHumidity,
         **common,
     )
+    wind_units = _weather_wind_engineering_units(tuning)
+    precip_units = _weather_precip_engineering_units(tuning)
     ai_wind = AnalogInputObject(
         objectIdentifier=ObjectIdentifier("analog-input,4"),
         objectName=CharacterString("Weather-WindSpeed"),
-        description=CharacterString("Wind speed at 10 m (m/s)"),
+        description=CharacterString(
+            "Wind speed at 10 m (mph)"
+            if _weather_imperial_bundle(tuning)
+            else "Wind speed at 10 m (m/s)"
+        ),
         presentValue=Real(0.0),
         covIncrement=Real(0.1),
-        units=EngineeringUnits.metersPerSecond,
+        units=wind_units,
         **common,
     )
     ai_precip = AnalogInputObject(
         objectIdentifier=ObjectIdentifier("analog-input,5"),
         objectName=CharacterString("Weather-Precipitation"),
-        description=CharacterString("Precipitation (mm)"),
+        description=CharacterString(
+            "Precipitation (in)" if _weather_imperial_bundle(tuning) else "Precipitation (mm)"
+        ),
         presentValue=Real(0.0),
         covIncrement=Real(0.1),
-        units=EngineeringUnits.millimeters,
+        units=precip_units,
         **common,
     )
 
@@ -1393,8 +1427,14 @@ class BacnetPypesClient:
             t_disp = (t_c * 9.0 / 5.0 + 32.0) if use_fahrenheit else t_c
             self._ai_weather_temp.presentValue = Real(float(t_disp))
             self._ai_weather_rh.presentValue = Real(float(result.humidity_percent))
-            self._ai_weather_wind.presentValue = Real(float(result.wind_speed_m_s))
-            self._ai_weather_precip.presentValue = Real(float(result.precipitation_mm))
+            if use_fahrenheit:
+                wind_disp = float(result.wind_speed_m_s) * _MS_TO_MPH
+                precip_disp = float(result.precipitation_mm) * _MM_TO_IN
+            else:
+                wind_disp = float(result.wind_speed_m_s)
+                precip_disp = float(result.precipitation_mm)
+            self._ai_weather_wind.presentValue = Real(wind_disp)
+            self._ai_weather_precip.presentValue = Real(precip_disp)
             self._bi_weather_ok.presentValue = BinaryPV.active
             self._csv_weather_last.presentValue = CharacterString(
                 _truncate_csv_text(
