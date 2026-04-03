@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class RemoteBacnetConfig(BaseModel):
@@ -52,13 +52,31 @@ class RemoteAgentTuning(BaseModel):
         default=None,
         validation_alias=AliasChoices("weather_longitude", "weatherLongitude"),
     )
-    weather_temperature_unit: Optional[Literal["celsius", "fahrenheit"]] = Field(
+    # SaaS edge JSON: false = metric (°C), true = imperial (°F); DB may still use celsius/fahrenheit strings.
+    weather_temperature_unit: Optional[bool] = Field(
         default=None,
         validation_alias=AliasChoices(
             "weather_temperature_unit",
             "weatherTemperatureUnit",
         ),
     )
+
+    @field_validator("weather_temperature_unit", mode="before")
+    @classmethod
+    def normalize_weather_temperature_unit(cls, v: object) -> Optional[bool]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s == "fahrenheit":
+                return True
+            if s == "celsius":
+                return False
+        raise ValueError(
+            "weather_temperature_unit must be bool or 'celsius' / 'fahrenheit'"
+        )
     weather_poll_interval_seconds: Optional[float] = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -94,7 +112,7 @@ def remote_weather_master_enabled(tuning: Optional[RemoteAgentTuning]) -> bool:
 
 
 def use_fahrenheit_from_tuning(tuning: Optional[RemoteAgentTuning]) -> bool:
-    return tuning is not None and tuning.weather_temperature_unit == "fahrenheit"
+    return tuning is not None and tuning.weather_temperature_unit is True
 
 
 def desired_weather_polling_enabled_from_tuning(tuning: Optional[RemoteAgentTuning]) -> bool:

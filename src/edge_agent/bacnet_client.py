@@ -455,10 +455,11 @@ def _create_weather_objects(
     )
     bi_unit = BinaryInputObject(
         objectIdentifier=ObjectIdentifier("binary-input,4"),
-        objectName=CharacterString("Weather-TempUnit"),
+        objectName=CharacterString("Weather-UnitOfMeasure"),
         presentValue=BinaryPV.active if use_fahrenheit_from_tuning(tuning) else BinaryPV.inactive,
         description=CharacterString(
-            "inactive=metric (C, km/h, mm/cm, hPa); active=imperial (F, mph, in, inHg)"
+            "Metric vs imperial (USA) bundle from SaaS: temp, wind, precip, snow, pressure. "
+            "inactive=Metric; active=Imperial"
         ),
         statusFlags=StatusFlags([0, 0, 0, 0]),
         eventState=EventState.normal,
@@ -1562,7 +1563,7 @@ class BacnetPypesClient:
         self._ai_weather_wdir: Optional[AnalogInputObject] = None
         self._ai_weather_wgust: Optional[AnalogInputObject] = None
         self._bi_weather_ok: Optional[BinaryInputObject] = None
-        self._bi_weather_temp_unit: Optional[BinaryInputObject] = None
+        self._bi_weather_unit_of_measure: Optional[BinaryInputObject] = None
         self._bi_weather_is_day: Optional[BinaryInputObject] = None
         self._bv_weather_polling: Optional[BinaryValueObject] = None
         self._csv_weather_last: Optional[_EdgeCharacterStringValue] = None
@@ -1684,7 +1685,7 @@ class BacnetPypesClient:
         self._ai_weather_wdir = ai_wx_wd
         self._ai_weather_wgust = ai_wx_wg
         self._bi_weather_ok = bi_wx_ok
-        self._bi_weather_temp_unit = bi_wx_u
+        self._bi_weather_unit_of_measure = bi_wx_u
         self._bi_weather_is_day = bi_wx_day
         self._bv_weather_polling = bv_wx_poll
         self._csv_weather_last = csv_wx
@@ -1809,12 +1810,12 @@ class BacnetPypesClient:
             or self._ai_weather_wdir is None
             or self._ai_weather_wgust is None
             or self._bi_weather_ok is None
-            or self._bi_weather_temp_unit is None
+            or self._bi_weather_unit_of_measure is None
             or self._bi_weather_is_day is None
             or self._csv_weather_last is None
         ):
             return
-        self._bi_weather_temp_unit.presentValue = (
+        self._bi_weather_unit_of_measure.presentValue = (
             BinaryPV.active if use_fahrenheit else BinaryPV.inactive
         )
         if result.fetch_ok:
@@ -1944,7 +1945,7 @@ class BacnetPypesClient:
         self._ai_weather_wdir = None
         self._ai_weather_wgust = None
         self._bi_weather_ok = None
-        self._bi_weather_temp_unit = None
+        self._bi_weather_unit_of_measure = None
         self._bi_weather_is_day = None
         self._bv_weather_polling = None
         self._csv_weather_last = None
