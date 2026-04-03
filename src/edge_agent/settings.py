@@ -54,7 +54,7 @@ class Settings(BaseSettings):
             return s
         return "unicast"
 
-    software_version: str = "0.1.9"
+    software_version: str = "0.1.10"
     who_is_timeout_seconds: float = 5.0
     read_device_live_max_objects: int = 500
     read_device_live_timeout_seconds: float = 120.0

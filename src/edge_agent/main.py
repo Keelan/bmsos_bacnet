@@ -26,6 +26,7 @@ from edge_agent.models import (
     utc_now_iso,
 )
 from edge_agent.open_meteo import fetch_current_weather
+from edge_agent.open_meteo_air_quality import fetch_current_air_quality
 from edge_agent.saas_client import SaasClient
 from edge_agent.settings import Settings
 from edge_agent.storage import Storage
@@ -251,12 +252,16 @@ async def _run_forever(settings: Settings) -> None:
                         continue
                     lat = float(tuning.weather_latitude)
                     lon = float(tuning.weather_longitude)
-                    result = await fetch_current_weather(
-                        lat,
-                        lon,
-                        timeout_seconds=min(30.0, float(settings.request_timeout_seconds)),
+                    tmo = min(30.0, float(settings.request_timeout_seconds))
+                    imperial = use_fahrenheit_from_tuning(tuning)
+                    wx_result, aq_result = await asyncio.gather(
+                        fetch_current_weather(
+                            lat, lon, imperial_bundle=imperial, timeout_seconds=tmo
+                        ),
+                        fetch_current_air_quality(lat, lon, timeout_seconds=tmo),
                     )
-                    bacnet.update_weather(result, use_fahrenheit_from_tuning(tuning))
+                    bacnet.update_weather(wx_result, imperial)
+                    bacnet.update_air_quality(aq_result)
             except Exception as e:
                 _log.debug("weather_poll_failed err=%s", e)
             await asyncio.sleep(

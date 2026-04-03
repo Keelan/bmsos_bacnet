@@ -56,6 +56,7 @@ from edge_agent.models import (
     utc_now_iso,
 )
 from edge_agent.open_meteo import OpenMeteoResult
+from edge_agent.open_meteo_air_quality import OpenMeteoAirQualityResult
 from edge_agent.settings import Settings
 from edge_agent.storage import Storage
 
@@ -235,7 +236,7 @@ def _weather_wind_engineering_units(tuning: Optional[RemoteAgentTuning]) -> Engi
     return (
         EngineeringUnits.milesPerHour
         if _weather_imperial_bundle(tuning)
-        else EngineeringUnits.metersPerSecond
+        else EngineeringUnits.kilometersPerHour
     )
 
 
@@ -247,9 +248,24 @@ def _weather_precip_engineering_units(tuning: Optional[RemoteAgentTuning]) -> En
     )
 
 
-# m/s → mph; mm → inches (25.4 mm per inch)
-_MS_TO_MPH = 2.2369362920544025
-_MM_TO_IN = 1.0 / 25.4
+def _weather_pressure_engineering_units(tuning: Optional[RemoteAgentTuning]) -> EngineeringUnits:
+    return (
+        EngineeringUnits.inchesOfMercury
+        if _weather_imperial_bundle(tuning)
+        else EngineeringUnits.hectopascals
+    )
+
+
+def _weather_snow_engineering_units(tuning: Optional[RemoteAgentTuning]) -> EngineeringUnits:
+    return (
+        EngineeringUnits.inches
+        if _weather_imperial_bundle(tuning)
+        else EngineeringUnits.centimeters
+    )
+
+
+# hPa → inHg (when imperial; Open-Meteo always returns hPa for pressure)
+_HPA_TO_INHG = 0.029529983071445
 
 
 def _create_weather_objects(
@@ -259,11 +275,26 @@ def _create_weather_objects(
     AnalogInputObject,
     AnalogInputObject,
     AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    BinaryInputObject,
     BinaryInputObject,
     BinaryInputObject,
     BinaryValueObject,
     _EdgeCharacterStringValue,
 ]:
+    """
+    Forecast weather points (Open-Meteo ``current``). Instance block AI 2–15; BI 3–4,6; BV 1; CSV 5.
+    Metric: km/h wind, mm precip/rain/showers, cm snow, hPa pressure. Imperial: mph, in, in snow, inHg.
+    """
     zf = StatusFlags([0, 0, 0, 0])
     common = {
         "statusFlags": zf,
@@ -271,10 +302,15 @@ def _create_weather_objects(
         "outOfService": Boolean(False),
     }
     temp_units = _weather_temp_engineering_units(tuning)
+    wind_units = _weather_wind_engineering_units(tuning)
+    precip_units = _weather_precip_engineering_units(tuning)
+    press_units = _weather_pressure_engineering_units(tuning)
+    snow_units = _weather_snow_engineering_units(tuning)
+
     ai_temp = AnalogInputObject(
         objectIdentifier=ObjectIdentifier("analog-input,2"),
         objectName=CharacterString("Weather-OutdoorTemp"),
-        description=CharacterString("Outdoor air temperature (from Open-Meteo)"),
+        description=CharacterString("Outdoor air temperature 2 m (Open-Meteo)"),
         presentValue=Real(0.0),
         covIncrement=Real(0.1),
         units=temp_units,
@@ -283,21 +319,17 @@ def _create_weather_objects(
     ai_rh = AnalogInputObject(
         objectIdentifier=ObjectIdentifier("analog-input,3"),
         objectName=CharacterString("Weather-Humidity"),
-        description=CharacterString("Relative humidity (%)"),
+        description=CharacterString("Relative humidity 2 m (%)"),
         presentValue=Real(0.0),
         covIncrement=Real(1.0),
         units=EngineeringUnits.percentRelativeHumidity,
         **common,
     )
-    wind_units = _weather_wind_engineering_units(tuning)
-    precip_units = _weather_precip_engineering_units(tuning)
     ai_wind = AnalogInputObject(
         objectIdentifier=ObjectIdentifier("analog-input,4"),
         objectName=CharacterString("Weather-WindSpeed"),
         description=CharacterString(
-            "Wind speed at 10 m (mph)"
-            if _weather_imperial_bundle(tuning)
-            else "Wind speed at 10 m (m/s)"
+            "Wind speed 10 m (mph imperial, km/h metric)"
         ),
         presentValue=Real(0.0),
         covIncrement=Real(0.1),
@@ -307,12 +339,100 @@ def _create_weather_objects(
     ai_precip = AnalogInputObject(
         objectIdentifier=ObjectIdentifier("analog-input,5"),
         objectName=CharacterString("Weather-Precipitation"),
-        description=CharacterString(
-            "Precipitation (in)" if _weather_imperial_bundle(tuning) else "Precipitation (mm)"
-        ),
+        description=CharacterString("Precipitation preceding interval (in imperial, mm metric)"),
         presentValue=Real(0.0),
         covIncrement=Real(0.1),
         units=precip_units,
+        **common,
+    )
+    ai_apparent = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,6"),
+        objectName=CharacterString("Weather-ApparentTemp"),
+        description=CharacterString("Apparent (feels-like) temperature 2 m"),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=temp_units,
+        **common,
+    )
+    ai_rain = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,7"),
+        objectName=CharacterString("Weather-Rain"),
+        description=CharacterString("Rain preceding interval"),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=precip_units,
+        **common,
+    )
+    ai_showers = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,8"),
+        objectName=CharacterString("Weather-Showers"),
+        description=CharacterString("Showers preceding interval"),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=precip_units,
+        **common,
+    )
+    ai_snow = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,9"),
+        objectName=CharacterString("Weather-Snowfall"),
+        description=CharacterString("Snowfall preceding interval (cm metric, in imperial)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.05),
+        units=snow_units,
+        **common,
+    )
+    ai_wcode = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,10"),
+        objectName=CharacterString("Weather-Code"),
+        description=CharacterString("WMO weather code (dimensionless)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(1.0),
+        units=EngineeringUnits.noUnits,
+        **common,
+    )
+    ai_cloud = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,11"),
+        objectName=CharacterString("Weather-CloudCover"),
+        description=CharacterString("Total cloud cover (%)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(1.0),
+        units=EngineeringUnits.percent,
+        **common,
+    )
+    ai_pmsl = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,12"),
+        objectName=CharacterString("Weather-Pressure-MSL"),
+        description=CharacterString("Sea level pressure (hPa metric, inHg imperial)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=press_units,
+        **common,
+    )
+    ai_psurf = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,13"),
+        objectName=CharacterString("Weather-Pressure-Surface"),
+        description=CharacterString("Surface pressure (hPa metric, inHg imperial)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=press_units,
+        **common,
+    )
+    ai_wdir = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,14"),
+        objectName=CharacterString("Weather-WindDirection"),
+        description=CharacterString("Wind direction 10 m (degrees)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(1.0),
+        units=EngineeringUnits.degreesAngular,
+        **common,
+    )
+    ai_wgust = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,15"),
+        objectName=CharacterString("Weather-WindGusts"),
+        description=CharacterString("Wind gusts 10 m (mph imperial, km/h metric)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=wind_units,
         **common,
     )
 
@@ -330,20 +450,34 @@ def _create_weather_objects(
         objectIdentifier=ObjectIdentifier("binary-input,3"),
         objectName=CharacterString("Weather-OK"),
         presentValue=BinaryPV.inactive,
-        description=CharacterString("Last Open-Meteo fetch succeeded"),
+        description=CharacterString("Last Open-Meteo Forecast fetch succeeded"),
         **_bi_wx_common(),
     )
     bi_unit = BinaryInputObject(
         objectIdentifier=ObjectIdentifier("binary-input,4"),
         objectName=CharacterString("Weather-TempUnit"),
         presentValue=BinaryPV.active if use_fahrenheit_from_tuning(tuning) else BinaryPV.inactive,
-        description=CharacterString("Temperature unit: inactive=Celsius, active=Fahrenheit"),
+        description=CharacterString(
+            "inactive=metric (C, km/h, mm/cm, hPa); active=imperial (F, mph, in, inHg)"
+        ),
         statusFlags=StatusFlags([0, 0, 0, 0]),
         eventState=EventState.normal,
         outOfService=Boolean(False),
         polarity=Polarity.normal,
-        inactiveText=CharacterString("Celsius"),
-        activeText=CharacterString("Fahrenheit"),
+        inactiveText=CharacterString("Metric"),
+        activeText=CharacterString("Imperial"),
+    )
+    bi_is_day = BinaryInputObject(
+        objectIdentifier=ObjectIdentifier("binary-input,6"),
+        objectName=CharacterString("Weather-IsDay"),
+        presentValue=BinaryPV.inactive,
+        description=CharacterString("Daylight from Open-Meteo is_day"),
+        statusFlags=StatusFlags([0, 0, 0, 0]),
+        eventState=EventState.normal,
+        outOfService=Boolean(False),
+        polarity=Polarity.normal,
+        inactiveText=CharacterString("Night"),
+        activeText=CharacterString("Day"),
     )
 
     poll_en = desired_weather_polling_enabled_from_tuning(tuning)
@@ -368,7 +502,164 @@ def _create_weather_objects(
         presentValue=CharacterString(""),
         **common,
     )
-    return ai_temp, ai_rh, ai_wind, ai_precip, bi_ok, bi_unit, bv_poll, csv_wx
+    return (
+        ai_temp,
+        ai_rh,
+        ai_wind,
+        ai_precip,
+        ai_apparent,
+        ai_rain,
+        ai_showers,
+        ai_snow,
+        ai_wcode,
+        ai_cloud,
+        ai_pmsl,
+        ai_psurf,
+        ai_wdir,
+        ai_wgust,
+        bi_ok,
+        bi_unit,
+        bi_is_day,
+        bv_poll,
+        csv_wx,
+    )
+
+
+def _create_air_quality_objects() -> tuple[
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    BinaryInputObject,
+    _EdgeCharacterStringValue,
+]:
+    """
+    Air-quality analog inputs (Open-Meteo Air Quality API).
+    Instance block: analog-input 34–42 (forecast weather uses 2–15), binary-input 5, CSV 6.
+
+    Engineering units: native Open-Meteo units for all modes (no USA/metric conversion;
+    ppm and μg/m³ are used for both product unit modes).
+    AOD and UV index use noUnits (dimensionless).
+    """
+    zf = StatusFlags([0, 0, 0, 0])
+    common = {
+        "statusFlags": zf,
+        "eventState": EventState.normal,
+        "outOfService": Boolean(False),
+    }
+
+    def _ai(instance: int, name: str, desc: str, units: EngineeringUnits, cov: float) -> AnalogInputObject:
+        return AnalogInputObject(
+            objectIdentifier=ObjectIdentifier(f"analog-input,{instance}"),
+            objectName=CharacterString(name),
+            description=CharacterString(desc),
+            presentValue=Real(0.0),
+            covIncrement=Real(float(cov)),
+            units=units,
+            **common,
+        )
+
+    ai_co2 = _ai(
+        34,
+        "Outdoor-CO2",
+        "Outdoor CO2 (Open-Meteo Air Quality API, ppm)",
+        EngineeringUnits.partsPerMillion,
+        1.0,
+    )
+    ai_pm25 = _ai(
+        35,
+        "Outdoor-PM2.5",
+        "Outdoor PM2.5 (μg/m³)",
+        EngineeringUnits.microgramsPerCubicMeter,
+        0.5,
+    )
+    ai_pm10 = _ai(
+        36,
+        "Outdoor-PM10",
+        "Outdoor PM10 (μg/m³)",
+        EngineeringUnits.microgramsPerCubicMeter,
+        0.5,
+    )
+    ai_co = _ai(
+        37,
+        "Outdoor-CO",
+        "Outdoor carbon monoxide (μg/m³)",
+        EngineeringUnits.microgramsPerCubicMeter,
+        1.0,
+    )
+    ai_no2 = _ai(
+        38,
+        "Outdoor-NO2",
+        "Outdoor nitrogen dioxide (μg/m³)",
+        EngineeringUnits.microgramsPerCubicMeter,
+        0.5,
+    )
+    ai_so2 = _ai(
+        39,
+        "Outdoor-SO2",
+        "Outdoor sulphur dioxide (μg/m³)",
+        EngineeringUnits.microgramsPerCubicMeter,
+        0.5,
+    )
+    ai_o3 = _ai(
+        40,
+        "Outdoor-O3",
+        "Outdoor ozone (μg/m³)",
+        EngineeringUnits.microgramsPerCubicMeter,
+        0.5,
+    )
+    ai_aod = _ai(
+        41,
+        "Outdoor-AOD",
+        "Aerosol optical depth at 550 nm (dimensionless)",
+        EngineeringUnits.noUnits,
+        0.01,
+    )
+    ai_uv = _ai(
+        42,
+        "Outdoor-UVIndex",
+        "UV index (dimensionless)",
+        EngineeringUnits.noUnits,
+        0.1,
+    )
+
+    bi_aq_ok = BinaryInputObject(
+        objectIdentifier=ObjectIdentifier("binary-input,5"),
+        objectName=CharacterString("Air-Quality-OK"),
+        presentValue=BinaryPV.inactive,
+        description=CharacterString("Last Open-Meteo Air Quality fetch succeeded"),
+        statusFlags=StatusFlags([0, 0, 0, 0]),
+        eventState=EventState.normal,
+        outOfService=Boolean(False),
+        polarity=Polarity.normal,
+        inactiveText=CharacterString("Offline"),
+        activeText=CharacterString("Online"),
+    )
+    csv_aq = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,6"),
+        objectName=CharacterString("Air-Quality-LastUpdate"),
+        description=CharacterString("Last air-quality fetch status or error"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    return (
+        ai_co2,
+        ai_pm25,
+        ai_pm10,
+        ai_co,
+        ai_no2,
+        ai_so2,
+        ai_o3,
+        ai_aod,
+        ai_uv,
+        bi_aq_ok,
+        csv_aq,
+    )
 
 
 def format_bacpypes_device_address(bind_ip: str, bind_prefix: int, udp_port: int) -> str:
@@ -1260,10 +1551,32 @@ class BacnetPypesClient:
         self._ai_weather_rh: Optional[AnalogInputObject] = None
         self._ai_weather_wind: Optional[AnalogInputObject] = None
         self._ai_weather_precip: Optional[AnalogInputObject] = None
+        self._ai_weather_apparent: Optional[AnalogInputObject] = None
+        self._ai_weather_rain: Optional[AnalogInputObject] = None
+        self._ai_weather_showers: Optional[AnalogInputObject] = None
+        self._ai_weather_snow: Optional[AnalogInputObject] = None
+        self._ai_weather_code: Optional[AnalogInputObject] = None
+        self._ai_weather_cloud: Optional[AnalogInputObject] = None
+        self._ai_weather_pmsl: Optional[AnalogInputObject] = None
+        self._ai_weather_psurf: Optional[AnalogInputObject] = None
+        self._ai_weather_wdir: Optional[AnalogInputObject] = None
+        self._ai_weather_wgust: Optional[AnalogInputObject] = None
         self._bi_weather_ok: Optional[BinaryInputObject] = None
         self._bi_weather_temp_unit: Optional[BinaryInputObject] = None
+        self._bi_weather_is_day: Optional[BinaryInputObject] = None
         self._bv_weather_polling: Optional[BinaryValueObject] = None
         self._csv_weather_last: Optional[_EdgeCharacterStringValue] = None
+        self._ai_aq_co2: Optional[AnalogInputObject] = None
+        self._ai_aq_pm25: Optional[AnalogInputObject] = None
+        self._ai_aq_pm10: Optional[AnalogInputObject] = None
+        self._ai_aq_co: Optional[AnalogInputObject] = None
+        self._ai_aq_no2: Optional[AnalogInputObject] = None
+        self._ai_aq_so2: Optional[AnalogInputObject] = None
+        self._ai_aq_o3: Optional[AnalogInputObject] = None
+        self._ai_aq_aod: Optional[AnalogInputObject] = None
+        self._ai_aq_uv: Optional[AnalogInputObject] = None
+        self._bi_aq_ok: Optional[BinaryInputObject] = None
+        self._csv_aq_last: Optional[_EdgeCharacterStringValue] = None
         self._iam_response_effective: str = "unicast"
 
     def _build_application(self) -> Application:
@@ -1318,8 +1631,19 @@ class BacnetPypesClient:
             ai_wx_rh,
             ai_wx_w,
             ai_wx_p,
+            ai_wx_app,
+            ai_wx_rn,
+            ai_wx_sh,
+            ai_wx_sn,
+            ai_wx_wc,
+            ai_wx_cl,
+            ai_wx_pmsl,
+            ai_wx_ps,
+            ai_wx_wd,
+            ai_wx_wg,
             bi_wx_ok,
             bi_wx_u,
+            bi_wx_day,
             bv_wx_poll,
             csv_wx,
         ) = _create_weather_objects(wx_tuning)
@@ -1328,8 +1652,19 @@ class BacnetPypesClient:
             ai_wx_rh,
             ai_wx_w,
             ai_wx_p,
+            ai_wx_app,
+            ai_wx_rn,
+            ai_wx_sh,
+            ai_wx_sn,
+            ai_wx_wc,
+            ai_wx_cl,
+            ai_wx_pmsl,
+            ai_wx_ps,
+            ai_wx_wd,
+            ai_wx_wg,
             bi_wx_ok,
             bi_wx_u,
+            bi_wx_day,
             bv_wx_poll,
             csv_wx,
         ):
@@ -1338,10 +1673,59 @@ class BacnetPypesClient:
         self._ai_weather_rh = ai_wx_rh
         self._ai_weather_wind = ai_wx_w
         self._ai_weather_precip = ai_wx_p
+        self._ai_weather_apparent = ai_wx_app
+        self._ai_weather_rain = ai_wx_rn
+        self._ai_weather_showers = ai_wx_sh
+        self._ai_weather_snow = ai_wx_sn
+        self._ai_weather_code = ai_wx_wc
+        self._ai_weather_cloud = ai_wx_cl
+        self._ai_weather_pmsl = ai_wx_pmsl
+        self._ai_weather_psurf = ai_wx_ps
+        self._ai_weather_wdir = ai_wx_wd
+        self._ai_weather_wgust = ai_wx_wg
         self._bi_weather_ok = bi_wx_ok
         self._bi_weather_temp_unit = bi_wx_u
+        self._bi_weather_is_day = bi_wx_day
         self._bv_weather_polling = bv_wx_poll
         self._csv_weather_last = csv_wx
+        (
+            ai_aq_co2,
+            ai_aq_pm25,
+            ai_aq_pm10,
+            ai_aq_co,
+            ai_aq_no2,
+            ai_aq_so2,
+            ai_aq_o3,
+            ai_aq_aod,
+            ai_aq_uv,
+            bi_aq_ok,
+            csv_aq,
+        ) = _create_air_quality_objects()
+        for o in (
+            ai_aq_co2,
+            ai_aq_pm25,
+            ai_aq_pm10,
+            ai_aq_co,
+            ai_aq_no2,
+            ai_aq_so2,
+            ai_aq_o3,
+            ai_aq_aod,
+            ai_aq_uv,
+            bi_aq_ok,
+            csv_aq,
+        ):
+            app.add_object(o)
+        self._ai_aq_co2 = ai_aq_co2
+        self._ai_aq_pm25 = ai_aq_pm25
+        self._ai_aq_pm10 = ai_aq_pm10
+        self._ai_aq_co = ai_aq_co
+        self._ai_aq_no2 = ai_aq_no2
+        self._ai_aq_so2 = ai_aq_so2
+        self._ai_aq_o3 = ai_aq_o3
+        self._ai_aq_aod = ai_aq_aod
+        self._ai_aq_uv = ai_aq_uv
+        self._bi_aq_ok = bi_aq_ok
+        self._csv_aq_last = csv_aq
         self._iam_response_effective = self._effective.iam_response_mode
         _patch_whois_iam_response(app, self._iam_response_effective)
         return app
@@ -1408,14 +1792,25 @@ class BacnetPypesClient:
         return self._bv_weather_polling.presentValue == BinaryPV.active
 
     def update_weather(self, result: OpenMeteoResult, use_fahrenheit: bool) -> None:
-        """Update weather analog/binary inputs and CSV; on failure keep last analog values."""
+        """Update forecast weather points; on failure keep last analog values and Weather-IsDay."""
         if (
             self._ai_weather_temp is None
             or self._ai_weather_rh is None
             or self._ai_weather_wind is None
             or self._ai_weather_precip is None
+            or self._ai_weather_apparent is None
+            or self._ai_weather_rain is None
+            or self._ai_weather_showers is None
+            or self._ai_weather_snow is None
+            or self._ai_weather_code is None
+            or self._ai_weather_cloud is None
+            or self._ai_weather_pmsl is None
+            or self._ai_weather_psurf is None
+            or self._ai_weather_wdir is None
+            or self._ai_weather_wgust is None
             or self._bi_weather_ok is None
             or self._bi_weather_temp_unit is None
+            or self._bi_weather_is_day is None
             or self._csv_weather_last is None
         ):
             return
@@ -1425,16 +1820,33 @@ class BacnetPypesClient:
         if result.fetch_ok:
             t_c = result.temperature_c
             t_disp = (t_c * 9.0 / 5.0 + 32.0) if use_fahrenheit else t_c
+            at_c = result.apparent_temperature_c
+            at_disp = (at_c * 9.0 / 5.0 + 32.0) if use_fahrenheit else at_c
             self._ai_weather_temp.presentValue = Real(float(t_disp))
+            self._ai_weather_apparent.presentValue = Real(float(at_disp))
             self._ai_weather_rh.presentValue = Real(float(result.humidity_percent))
+            self._ai_weather_wind.presentValue = Real(float(result.wind_speed))
+            self._ai_weather_wgust.presentValue = Real(float(result.wind_gust))
+            self._ai_weather_precip.presentValue = Real(float(result.precipitation))
+            self._ai_weather_rain.presentValue = Real(float(result.rain))
+            self._ai_weather_showers.presentValue = Real(float(result.showers))
+            self._ai_weather_snow.presentValue = Real(float(result.snowfall))
+            self._ai_weather_code.presentValue = Real(float(result.weather_code))
+            self._ai_weather_cloud.presentValue = Real(float(result.cloud_cover_percent))
+            self._ai_weather_wdir.presentValue = Real(float(result.wind_direction_deg))
             if use_fahrenheit:
-                wind_disp = float(result.wind_speed_m_s) * _MS_TO_MPH
-                precip_disp = float(result.precipitation_mm) * _MM_TO_IN
+                self._ai_weather_pmsl.presentValue = Real(
+                    float(result.pressure_msl_hpa) * _HPA_TO_INHG
+                )
+                self._ai_weather_psurf.presentValue = Real(
+                    float(result.surface_pressure_hpa) * _HPA_TO_INHG
+                )
             else:
-                wind_disp = float(result.wind_speed_m_s)
-                precip_disp = float(result.precipitation_mm)
-            self._ai_weather_wind.presentValue = Real(wind_disp)
-            self._ai_weather_precip.presentValue = Real(precip_disp)
+                self._ai_weather_pmsl.presentValue = Real(float(result.pressure_msl_hpa))
+                self._ai_weather_psurf.presentValue = Real(float(result.surface_pressure_hpa))
+            self._bi_weather_is_day.presentValue = (
+                BinaryPV.active if result.is_day else BinaryPV.inactive
+            )
             self._bi_weather_ok.presentValue = BinaryPV.active
             self._csv_weather_last.presentValue = CharacterString(
                 _truncate_csv_text(
@@ -1445,6 +1857,43 @@ class BacnetPypesClient:
             self._bi_weather_ok.presentValue = BinaryPV.inactive
             err = (result.error or "fetch_failed").strip() or "fetch_failed"
             self._csv_weather_last.presentValue = CharacterString(_truncate_csv_text(f"err {err}"))
+
+    def update_air_quality(self, result: OpenMeteoAirQualityResult) -> None:
+        """Update air-quality analog inputs; on failure keep last analog values (like weather)."""
+        if (
+            self._ai_aq_co2 is None
+            or self._ai_aq_pm25 is None
+            or self._ai_aq_pm10 is None
+            or self._ai_aq_co is None
+            or self._ai_aq_no2 is None
+            or self._ai_aq_so2 is None
+            or self._ai_aq_o3 is None
+            or self._ai_aq_aod is None
+            or self._ai_aq_uv is None
+            or self._bi_aq_ok is None
+            or self._csv_aq_last is None
+        ):
+            return
+        if result.fetch_ok:
+            self._ai_aq_co2.presentValue = Real(float(result.carbon_dioxide_ppm))
+            self._ai_aq_pm25.presentValue = Real(float(result.pm2_5_ugm3))
+            self._ai_aq_pm10.presentValue = Real(float(result.pm10_ugm3))
+            self._ai_aq_co.presentValue = Real(float(result.carbon_monoxide_ugm3))
+            self._ai_aq_no2.presentValue = Real(float(result.nitrogen_dioxide_ugm3))
+            self._ai_aq_so2.presentValue = Real(float(result.sulphur_dioxide_ugm3))
+            self._ai_aq_o3.presentValue = Real(float(result.ozone_ugm3))
+            self._ai_aq_aod.presentValue = Real(float(result.aerosol_optical_depth))
+            self._ai_aq_uv.presentValue = Real(float(result.uv_index))
+            self._bi_aq_ok.presentValue = BinaryPV.active
+            self._csv_aq_last.presentValue = CharacterString(
+                _truncate_csv_text(
+                    f"ok co2={result.carbon_dioxide_ppm:.1f}pm pm2.5={result.pm2_5_ugm3:.1f}"
+                )
+            )
+        else:
+            self._bi_aq_ok.presentValue = BinaryPV.inactive
+            err = (result.error or "fetch_failed").strip() or "fetch_failed"
+            self._csv_aq_last.presentValue = CharacterString(_truncate_csv_text(f"err {err}"))
 
     async def start(self) -> None:
         if self._app is not None:
@@ -1484,10 +1933,32 @@ class BacnetPypesClient:
         self._ai_weather_rh = None
         self._ai_weather_wind = None
         self._ai_weather_precip = None
+        self._ai_weather_apparent = None
+        self._ai_weather_rain = None
+        self._ai_weather_showers = None
+        self._ai_weather_snow = None
+        self._ai_weather_code = None
+        self._ai_weather_cloud = None
+        self._ai_weather_pmsl = None
+        self._ai_weather_psurf = None
+        self._ai_weather_wdir = None
+        self._ai_weather_wgust = None
         self._bi_weather_ok = None
         self._bi_weather_temp_unit = None
+        self._bi_weather_is_day = None
         self._bv_weather_polling = None
         self._csv_weather_last = None
+        self._ai_aq_co2 = None
+        self._ai_aq_pm25 = None
+        self._ai_aq_pm10 = None
+        self._ai_aq_co = None
+        self._ai_aq_no2 = None
+        self._ai_aq_so2 = None
+        self._ai_aq_o3 = None
+        self._ai_aq_aod = None
+        self._ai_aq_uv = None
+        self._bi_aq_ok = None
+        self._csv_aq_last = None
 
     async def restart(self, effective: EffectiveBacnetConfig) -> None:
         await self.stop()
