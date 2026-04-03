@@ -47,6 +47,7 @@ from bacpypes3.pdu import Address, LocalBroadcast
 from bacpypes3.primitivedata import Boolean, CharacterString, Null, ObjectIdentifier, Real, Unsigned
 
 from edge_agent.json_safe import failure_message, to_json_safe
+from edge_agent.weather_decision_points import compute_outdoor_decisions
 from edge_agent.weather_derived import (
     dew_point_celsius,
     heat_index_display,
@@ -586,7 +587,8 @@ def _create_weather_derived_objects(
         Weather-OutdoorTemp: °C metric, °F imperial).
       - characterstringValue 11: WMO weather code description (numeric code remains AI 10).
 
-    Gap AI 19–33 reserved for future weather-related analogs (site time uses 43+).
+    AI 19–20: dew-point spread + enthalpy (see ``_create_weather_decision_objects``).
+    Gap AI 21–33 reserved for future weather analogs (site time uses 43+).
     """
     zf = StatusFlags([0, 0, 0, 0])
     common = {
@@ -636,6 +638,275 @@ def _create_weather_derived_objects(
         **common,
     )
     return ai_dew, ai_hi, ai_wc, csv_code
+
+
+def _create_weather_decision_objects(
+    tuning: Optional[RemoteAgentTuning],
+) -> tuple[
+    AnalogInputObject,
+    AnalogInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    _EdgeMultiStateInput,
+    _EdgeMultiStateInput,
+    _EdgeMultiStateInput,
+    _EdgeMultiStateInput,
+    _EdgeMultiStateInput,
+    _EdgeMultiStateInput,
+    _EdgeMultiStateInput,
+    _EdgeMultiStateInput,
+    _EdgeMultiStateInput,
+]:
+    """
+    Decision / operational signals (local thresholds; see ``weather_decision_points``).
+
+    Instance reservation (no overlap with weather AI 2–18, AQ 34–42, site 43–50):
+      - analog-input 19–20: dew-point spread, enthalpy (units follow metric/imperial).
+      - binary-input 9–19: moisture, thermal, solar, precip, wind, AQ, economizer flags.
+      - multiStateInput 3–10: AQI category, daylight, wind severity, comfort, dominant
+        pollutant, weather severity, heat stress, cold stress.
+
+    Edge job uses multiStateInput 1; site weekday uses multiStateInput 2.
+    """
+    zf = StatusFlags([0, 0, 0, 0])
+    common = {
+        "statusFlags": zf,
+        "eventState": EventState.normal,
+        "outOfService": Boolean(False),
+    }
+    temp_units = _weather_temp_engineering_units(tuning)
+    imperial = _weather_imperial_bundle(tuning)
+    enth_units = (
+        EngineeringUnits.btusPerPoundDryAir
+        if imperial
+        else EngineeringUnits.kilojoulesPerKilogramDryAir
+    )
+
+    def _bi(instance: int, name: str, desc: str, inactive: str, active: str) -> BinaryInputObject:
+        return BinaryInputObject(
+            objectIdentifier=ObjectIdentifier(f"binary-input,{instance}"),
+            objectName=CharacterString(name),
+            description=CharacterString(desc),
+            presentValue=BinaryPV.inactive,
+            polarity=Polarity.normal,
+            inactiveText=CharacterString(inactive),
+            activeText=CharacterString(active),
+            **common,
+        )
+
+    ai_spread = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,19"),
+        objectName=CharacterString("Weather-DewPointSpread"),
+        description=CharacterString("Dry-bulb minus dew point (same ° as outdoor temp)"),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.1),
+        units=temp_units,
+        **common,
+    )
+    ai_h = AnalogInputObject(
+        objectIdentifier=ObjectIdentifier("analog-input,20"),
+        objectName=CharacterString("Weather-OutdoorEnthalpy"),
+        description=CharacterString(
+            "Moist air enthalpy (kJ/kg dry air metric, BTU/lb dry air imperial); ~sea level"
+        ),
+        presentValue=Real(0.0),
+        covIncrement=Real(0.5),
+        units=enth_units,
+        **common,
+    )
+
+    bi_cond = _bi(
+        9,
+        "Weather-Condensation-Risk",
+        "Small dew-point spread (surface condensation hint)",
+        "Normal",
+        "Risk",
+    )
+    bi_frz = _bi(10, "Weather-Freeze-Risk", "Dry-bulb at or below freezing", "No", "Yes")
+    bi_frost = _bi(11, "Weather-Frost-Risk", "Cool humid / near-saturation (coarse)", "No", "Yes")
+    bi_solar = _bi(12, "Weather-Solar-Available", "Daytime and cloud cover < 75%", "No", "Yes")
+    bi_precip = _bi(13, "Weather-Precipitation-Active", "Liquid precip in current interval", "No", "Yes")
+    bi_snow = _bi(14, "Weather-Snow-Active", "Snowfall in current interval", "No", "Yes")
+    bi_hw = _bi(15, "Weather-High-Wind", "Wind or gust above coarse threshold", "No", "Yes")
+    bi_smoke = _bi(16, "Outdoor-Smoke-Risk", "PM2.5 elevated (operational, not AQI official)", "No", "Yes")
+    bi_aqg = _bi(17, "Outdoor-Air-Quality-Good", "Coarse OK for ventilation (PM2.5/PM10)", "No", "Yes")
+    bi_econ = _bi(18, "Weather-Economizer-Available", "Dry-bulb + enthalpy + PM2.5 gate (wx+aq)", "No", "Yes")
+    bi_oa = _bi(19, "Weather-Outdoor-Air-Usable", "Reasonable OA per enthalpy + AQ (wx+aq)", "No", "Yes")
+
+    st_aqi = ArrayOf(StateTextString)(
+        [
+            StateTextString("Good"),
+            StateTextString("Moderate"),
+            StateTextString("UnhealthySG"),
+            StateTextString("Unhealthy"),
+            StateTextString("VeryUnhealthy"),
+            StateTextString("Hazardous"),
+        ]
+    )
+    msi_aqi = _EdgeMultiStateInput(
+        objectIdentifier=ObjectIdentifier("multiStateInput,3"),
+        objectName=CharacterString("Outdoor-AQI-Category"),
+        description=CharacterString("PM2.5 band category (μg/m³ thresholds; not official AQI)"),
+        presentValue=Unsigned(1),
+        numberOfStates=Unsigned(6),
+        stateText=st_aqi,
+        **common,
+    )
+    st_day = ArrayOf(StateTextString)(
+        [
+            StateTextString("Night"),
+            StateTextString("Low"),
+            StateTextString("Medium"),
+            StateTextString("Bright"),
+        ]
+    )
+    msi_day = _EdgeMultiStateInput(
+        objectIdentifier=ObjectIdentifier("multiStateInput,4"),
+        objectName=CharacterString("Weather-Daylight-Level"),
+        description=CharacterString("From is_day + cloud cover bands"),
+        presentValue=Unsigned(1),
+        numberOfStates=Unsigned(4),
+        stateText=st_day,
+        **common,
+    )
+    st_wind = ArrayOf(StateTextString)(
+        [
+            StateTextString("Calm"),
+            StateTextString("Breezy"),
+            StateTextString("Windy"),
+            StateTextString("Severe"),
+        ]
+    )
+    msi_wind = _EdgeMultiStateInput(
+        objectIdentifier=ObjectIdentifier("multiStateInput,5"),
+        objectName=CharacterString("Weather-Wind-Severity"),
+        description=CharacterString("From wind/gust vs mode-specific bands"),
+        presentValue=Unsigned(1),
+        numberOfStates=Unsigned(4),
+        stateText=st_wind,
+        **common,
+    )
+    st_comf = ArrayOf(StateTextString)(
+        [
+            StateTextString("Cold"),
+            StateTextString("Cool"),
+            StateTextString("Neutral"),
+            StateTextString("Warm"),
+            StateTextString("Hot"),
+        ]
+    )
+    msi_comf = _EdgeMultiStateInput(
+        objectIdentifier=ObjectIdentifier("multiStateInput,6"),
+        objectName=CharacterString("Weather-Comfort-Level"),
+        description=CharacterString("From apparent temperature bands"),
+        presentValue=Unsigned(1),
+        numberOfStates=Unsigned(5),
+        stateText=st_comf,
+        **common,
+    )
+    st_dom = ArrayOf(StateTextString)(
+        [
+            StateTextString("None"),
+            StateTextString("PM2.5"),
+            StateTextString("PM10"),
+            StateTextString("O3"),
+            StateTextString("NO2"),
+            StateTextString("SO2"),
+            StateTextString("CO"),
+            StateTextString("CO2"),
+        ]
+    )
+    msi_dom = _EdgeMultiStateInput(
+        objectIdentifier=ObjectIdentifier("multiStateInput,7"),
+        objectName=CharacterString("Outdoor-Dominant-Pollutant"),
+        description=CharacterString("Largest signal among reported species (ranking heuristic)"),
+        presentValue=Unsigned(1),
+        numberOfStates=Unsigned(8),
+        stateText=st_dom,
+        **common,
+    )
+    st_wxsev = ArrayOf(StateTextString)(
+        [
+            StateTextString("Calm"),
+            StateTextString("Moderate"),
+            StateTextString("Severe"),
+            StateTextString("Extreme"),
+        ]
+    )
+    msi_wxsev = _EdgeMultiStateInput(
+        objectIdentifier=ObjectIdentifier("multiStateInput,8"),
+        objectName=CharacterString("Weather-Severity"),
+        description=CharacterString("Coarse blend of WMO code, precip, wind"),
+        presentValue=Unsigned(1),
+        numberOfStates=Unsigned(4),
+        stateText=st_wxsev,
+        **common,
+    )
+    st_heat = ArrayOf(StateTextString)(
+        [
+            StateTextString("Low"),
+            StateTextString("Moderate"),
+            StateTextString("High"),
+        ]
+    )
+    msi_heat = _EdgeMultiStateInput(
+        objectIdentifier=ObjectIdentifier("multiStateInput,9"),
+        objectName=CharacterString("Outdoor-Heat-Stress"),
+        description=CharacterString("From heat index bands"),
+        presentValue=Unsigned(1),
+        numberOfStates=Unsigned(3),
+        stateText=st_heat,
+        **common,
+    )
+    st_cold = ArrayOf(StateTextString)(
+        [
+            StateTextString("Low"),
+            StateTextString("Moderate"),
+            StateTextString("High"),
+        ]
+    )
+    msi_cold = _EdgeMultiStateInput(
+        objectIdentifier=ObjectIdentifier("multiStateInput,10"),
+        objectName=CharacterString("Outdoor-Cold-Stress"),
+        description=CharacterString("From wind-chill bands"),
+        presentValue=Unsigned(1),
+        numberOfStates=Unsigned(3),
+        stateText=st_cold,
+        **common,
+    )
+
+    return (
+        ai_spread,
+        ai_h,
+        bi_cond,
+        bi_frz,
+        bi_frost,
+        bi_solar,
+        bi_precip,
+        bi_snow,
+        bi_hw,
+        bi_smoke,
+        bi_aqg,
+        bi_econ,
+        bi_oa,
+        msi_aqi,
+        msi_day,
+        msi_wind,
+        msi_comf,
+        msi_dom,
+        msi_wxsev,
+        msi_heat,
+        msi_cold,
+    )
 
 
 def _create_air_quality_objects() -> tuple[
@@ -802,6 +1073,7 @@ def _create_site_time_objects() -> tuple[
     - binary-input 7–8: Site-Time-OK, Site-DST-Active
     - analog-input 43–50: calendar components + UTC offset minutes
     - multiStateInput 2: Site-Weekday (state 1–7 = ISO Monday–Sunday; same as Site-Weekday-Number AI)
+    - multiStateInput 3–10: outdoor decision categories (see ``_create_weather_decision_objects``)
     """
     zf = StatusFlags([0, 0, 0, 0])
     common = {
@@ -1870,6 +2142,27 @@ class BacnetPypesClient:
         self._ai_weather_heat_index: Optional[AnalogInputObject] = None
         self._ai_weather_wind_chill: Optional[AnalogInputObject] = None
         self._csv_weather_code_text: Optional[_EdgeCharacterStringValue] = None
+        self._ai_weather_dew_spread: Optional[AnalogInputObject] = None
+        self._ai_weather_enthalpy: Optional[AnalogInputObject] = None
+        self._bi_weather_condensation_risk: Optional[BinaryInputObject] = None
+        self._bi_weather_freeze_risk: Optional[BinaryInputObject] = None
+        self._bi_weather_frost_risk: Optional[BinaryInputObject] = None
+        self._bi_weather_solar_available: Optional[BinaryInputObject] = None
+        self._bi_weather_precipitation_active: Optional[BinaryInputObject] = None
+        self._bi_weather_snow_active: Optional[BinaryInputObject] = None
+        self._bi_weather_high_wind: Optional[BinaryInputObject] = None
+        self._bi_outdoor_smoke_risk: Optional[BinaryInputObject] = None
+        self._bi_outdoor_air_quality_good: Optional[BinaryInputObject] = None
+        self._bi_weather_economizer_available: Optional[BinaryInputObject] = None
+        self._bi_weather_outdoor_air_usable: Optional[BinaryInputObject] = None
+        self._msi_outdoor_aqi_category: Optional[_EdgeMultiStateInput] = None
+        self._msi_weather_daylight_level: Optional[_EdgeMultiStateInput] = None
+        self._msi_weather_wind_severity: Optional[_EdgeMultiStateInput] = None
+        self._msi_weather_comfort_level: Optional[_EdgeMultiStateInput] = None
+        self._msi_outdoor_dominant_pollutant: Optional[_EdgeMultiStateInput] = None
+        self._msi_weather_severity: Optional[_EdgeMultiStateInput] = None
+        self._msi_outdoor_heat_stress: Optional[_EdgeMultiStateInput] = None
+        self._msi_outdoor_cold_stress: Optional[_EdgeMultiStateInput] = None
         self._ai_aq_co2: Optional[AnalogInputObject] = None
         self._ai_aq_pm25: Optional[AnalogInputObject] = None
         self._ai_aq_pm10: Optional[AnalogInputObject] = None
@@ -2014,6 +2307,74 @@ class BacnetPypesClient:
         self._ai_weather_heat_index = ai_wx_hi
         self._ai_weather_wind_chill = ai_wx_wc
         self._csv_weather_code_text = csv_wx_code
+        (
+            ai_wx_spread,
+            ai_wx_enthalpy,
+            bi_wx_cond,
+            bi_wx_frz,
+            bi_wx_frost,
+            bi_wx_solar,
+            bi_wx_precip,
+            bi_wx_snow,
+            bi_wx_hw,
+            bi_out_smoke,
+            bi_out_aqg,
+            bi_wx_econ,
+            bi_wx_oa,
+            msi_aqi,
+            msi_dayl,
+            msi_wsev,
+            msi_comf,
+            msi_dom,
+            msi_wxsev,
+            msi_heat,
+            msi_cold,
+        ) = _create_weather_decision_objects(wx_tuning)
+        for o in (
+            ai_wx_spread,
+            ai_wx_enthalpy,
+            bi_wx_cond,
+            bi_wx_frz,
+            bi_wx_frost,
+            bi_wx_solar,
+            bi_wx_precip,
+            bi_wx_snow,
+            bi_wx_hw,
+            bi_out_smoke,
+            bi_out_aqg,
+            bi_wx_econ,
+            bi_wx_oa,
+            msi_aqi,
+            msi_dayl,
+            msi_wsev,
+            msi_comf,
+            msi_dom,
+            msi_wxsev,
+            msi_heat,
+            msi_cold,
+        ):
+            app.add_object(o)
+        self._ai_weather_dew_spread = ai_wx_spread
+        self._ai_weather_enthalpy = ai_wx_enthalpy
+        self._bi_weather_condensation_risk = bi_wx_cond
+        self._bi_weather_freeze_risk = bi_wx_frz
+        self._bi_weather_frost_risk = bi_wx_frost
+        self._bi_weather_solar_available = bi_wx_solar
+        self._bi_weather_precipitation_active = bi_wx_precip
+        self._bi_weather_snow_active = bi_wx_snow
+        self._bi_weather_high_wind = bi_wx_hw
+        self._bi_outdoor_smoke_risk = bi_out_smoke
+        self._bi_outdoor_air_quality_good = bi_out_aqg
+        self._bi_weather_economizer_available = bi_wx_econ
+        self._bi_weather_outdoor_air_usable = bi_wx_oa
+        self._msi_outdoor_aqi_category = msi_aqi
+        self._msi_weather_daylight_level = msi_dayl
+        self._msi_weather_wind_severity = msi_wsev
+        self._msi_weather_comfort_level = msi_comf
+        self._msi_outdoor_dominant_pollutant = msi_dom
+        self._msi_weather_severity = msi_wxsev
+        self._msi_outdoor_heat_stress = msi_heat
+        self._msi_outdoor_cold_stress = msi_cold
         (
             ai_aq_co2,
             ai_aq_pm25,
@@ -2298,6 +2659,104 @@ class BacnetPypesClient:
             err = (result.error or "fetch_failed").strip() or "fetch_failed"
             self._csv_aq_last.presentValue = CharacterString(_truncate_csv_text(f"err {err}"))
 
+    def update_outdoor_decision_points(
+        self,
+        wx: OpenMeteoResult,
+        aq: OpenMeteoAirQualityResult,
+        use_fahrenheit: bool,
+    ) -> None:
+        """Decision BI/MSI and extra AIs from latest fetch results (preserves last on partial failure)."""
+        if (
+            self._ai_weather_dew_spread is None
+            or self._ai_weather_enthalpy is None
+            or self._bi_weather_condensation_risk is None
+            or self._bi_weather_freeze_risk is None
+            or self._bi_weather_frost_risk is None
+            or self._bi_weather_solar_available is None
+            or self._bi_weather_precipitation_active is None
+            or self._bi_weather_snow_active is None
+            or self._bi_weather_high_wind is None
+            or self._bi_outdoor_smoke_risk is None
+            or self._bi_outdoor_air_quality_good is None
+            or self._bi_weather_economizer_available is None
+            or self._bi_weather_outdoor_air_usable is None
+            or self._msi_outdoor_aqi_category is None
+            or self._msi_weather_daylight_level is None
+            or self._msi_weather_wind_severity is None
+            or self._msi_weather_comfort_level is None
+            or self._msi_outdoor_dominant_pollutant is None
+            or self._msi_weather_severity is None
+            or self._msi_outdoor_heat_stress is None
+            or self._msi_outdoor_cold_stress is None
+        ):
+            return
+        dec = compute_outdoor_decisions(
+            wx,
+            aq,
+            wx_ok=wx.fetch_ok,
+            aq_ok=aq.fetch_ok,
+            use_fahrenheit=use_fahrenheit,
+            imperial_bundle=use_fahrenheit,
+        )
+        if dec.dew_spread is not None:
+            self._ai_weather_dew_spread.presentValue = Real(float(dec.dew_spread))
+        if dec.enthalpy is not None:
+            self._ai_weather_enthalpy.presentValue = Real(float(dec.enthalpy))
+        if dec.bi_condensation is not None:
+            self._bi_weather_condensation_risk.presentValue = (
+                BinaryPV.active if dec.bi_condensation else BinaryPV.inactive
+            )
+        if dec.bi_freeze is not None:
+            self._bi_weather_freeze_risk.presentValue = (
+                BinaryPV.active if dec.bi_freeze else BinaryPV.inactive
+            )
+        if dec.bi_frost is not None:
+            self._bi_weather_frost_risk.presentValue = (
+                BinaryPV.active if dec.bi_frost else BinaryPV.inactive
+            )
+        if dec.bi_solar is not None:
+            self._bi_weather_solar_available.presentValue = (
+                BinaryPV.active if dec.bi_solar else BinaryPV.inactive
+            )
+        if dec.bi_precip is not None:
+            self._bi_weather_precipitation_active.presentValue = (
+                BinaryPV.active if dec.bi_precip else BinaryPV.inactive
+            )
+        if dec.bi_snow is not None:
+            self._bi_weather_snow_active.presentValue = BinaryPV.active if dec.bi_snow else BinaryPV.inactive
+        if dec.bi_high_wind is not None:
+            self._bi_weather_high_wind.presentValue = BinaryPV.active if dec.bi_high_wind else BinaryPV.inactive
+        if dec.bi_smoke is not None:
+            self._bi_outdoor_smoke_risk.presentValue = BinaryPV.active if dec.bi_smoke else BinaryPV.inactive
+        if dec.bi_aq_good is not None:
+            self._bi_outdoor_air_quality_good.presentValue = (
+                BinaryPV.active if dec.bi_aq_good else BinaryPV.inactive
+            )
+        if dec.bi_econo is not None:
+            self._bi_weather_economizer_available.presentValue = (
+                BinaryPV.active if dec.bi_econo else BinaryPV.inactive
+            )
+        if dec.bi_oa_usable is not None:
+            self._bi_weather_outdoor_air_usable.presentValue = (
+                BinaryPV.active if dec.bi_oa_usable else BinaryPV.inactive
+            )
+        if dec.msi_aqi is not None:
+            self._msi_outdoor_aqi_category.presentValue = Unsigned(int(dec.msi_aqi))
+        if dec.msi_daylight is not None:
+            self._msi_weather_daylight_level.presentValue = Unsigned(int(dec.msi_daylight))
+        if dec.msi_wind_sev is not None:
+            self._msi_weather_wind_severity.presentValue = Unsigned(int(dec.msi_wind_sev))
+        if dec.msi_comfort is not None:
+            self._msi_weather_comfort_level.presentValue = Unsigned(int(dec.msi_comfort))
+        if dec.msi_dominant is not None:
+            self._msi_outdoor_dominant_pollutant.presentValue = Unsigned(int(dec.msi_dominant))
+        if dec.msi_weather_sev is not None:
+            self._msi_weather_severity.presentValue = Unsigned(int(dec.msi_weather_sev))
+        if dec.msi_heat is not None:
+            self._msi_outdoor_heat_stress.presentValue = Unsigned(int(dec.msi_heat))
+        if dec.msi_cold is not None:
+            self._msi_outdoor_cold_stress.presentValue = Unsigned(int(dec.msi_cold))
+
     def update_site_time(self, info: SiteLocalTimeInfo) -> None:
         """Update site-local time BACnet points; on failure only clears OK/DST (preserves last strings/values)."""
         if (
@@ -2399,6 +2858,27 @@ class BacnetPypesClient:
         self._ai_weather_heat_index = None
         self._ai_weather_wind_chill = None
         self._csv_weather_code_text = None
+        self._ai_weather_dew_spread = None
+        self._ai_weather_enthalpy = None
+        self._bi_weather_condensation_risk = None
+        self._bi_weather_freeze_risk = None
+        self._bi_weather_frost_risk = None
+        self._bi_weather_solar_available = None
+        self._bi_weather_precipitation_active = None
+        self._bi_weather_snow_active = None
+        self._bi_weather_high_wind = None
+        self._bi_outdoor_smoke_risk = None
+        self._bi_outdoor_air_quality_good = None
+        self._bi_weather_economizer_available = None
+        self._bi_weather_outdoor_air_usable = None
+        self._msi_outdoor_aqi_category = None
+        self._msi_weather_daylight_level = None
+        self._msi_weather_wind_severity = None
+        self._msi_weather_comfort_level = None
+        self._msi_outdoor_dominant_pollutant = None
+        self._msi_weather_severity = None
+        self._msi_outdoor_heat_stress = None
+        self._msi_outdoor_cold_stress = None
         self._ai_aq_co2 = None
         self._ai_aq_pm25 = None
         self._ai_aq_pm10 = None

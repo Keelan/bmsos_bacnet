@@ -264,6 +264,7 @@ async def _run_forever(settings: Settings) -> None:
                     # Each updater keeps last good analogs when its fetch fails (partial success).
                     bacnet.update_weather(wx_result, imperial)
                     bacnet.update_air_quality(aq_result)
+                    bacnet.update_outdoor_decision_points(wx_result, aq_result, imperial)
             except Exception as e:
                 _log.debug("weather_poll_failed err=%s", e)
             await asyncio.sleep(
