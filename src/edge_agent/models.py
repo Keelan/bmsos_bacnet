@@ -98,6 +98,30 @@ class RemoteAgentTuning(BaseModel):
             "siteTimePollIntervalSeconds",
         ),
     )
+    # ISO 3166-1 alpha-2 for Nager.Date public holidays (e.g. CA, US, DE).
+    site_country_code: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("site_country_code", "siteCountryCode"),
+    )
+    schedule_context_poll_interval_seconds: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "schedule_context_poll_interval_seconds",
+            "scheduleContextPollIntervalSeconds",
+        ),
+    )
+
+    @field_validator("site_country_code", mode="before")
+    @classmethod
+    def normalize_site_country_code(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip().upper()
+        if not s:
+            return None
+        if len(s) != 2 or not s.isalpha():
+            raise ValueError("site_country_code must be a 2-letter ISO country code")
+        return s
 
 
 def weather_coords_valid(lat: Optional[float], lon: Optional[float]) -> bool:

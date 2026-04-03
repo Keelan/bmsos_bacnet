@@ -65,6 +65,8 @@ from edge_agent.models import (
 from edge_agent.open_meteo import OpenMeteoResult
 from edge_agent.open_meteo_air_quality import OpenMeteoAirQualityResult
 from edge_agent.settings import Settings
+from edge_agent.holidays import HolidayEval
+from edge_agent.open_meteo import SunTimesResult, daylight_window_active
 from edge_agent.site_time import SiteLocalTimeInfo
 from edge_agent.storage import Storage
 
@@ -1074,6 +1076,7 @@ def _create_site_time_objects() -> tuple[
     - analog-input 43–50: calendar components + UTC offset minutes
     - multiStateInput 2: Site-Weekday (state 1–7 = ISO Monday–Sunday; same as Site-Weekday-Number AI)
     - multiStateInput 3–10: outdoor decision categories (see ``_create_weather_decision_objects``)
+    - binary-input 20–25 + characterstringValue 12–14: schedule context (see ``_create_schedule_context_objects``)
     """
     zf = StatusFlags([0, 0, 0, 0])
     common = {
@@ -1232,6 +1235,80 @@ def _create_site_time_objects() -> tuple[
         msi_wd,
         ai_off,
     )
+
+
+def _create_schedule_context_objects() -> tuple[
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    _EdgeCharacterStringValue,
+    _EdgeCharacterStringValue,
+    _EdgeCharacterStringValue,
+]:
+    """
+    Holiday + sun schedule (Nager.Date + Open-Meteo daily sunrise/sunset).
+
+    Instance reservation:
+      - binary-input 20–25: holiday/business/long-weekend/daylight + API OK flags
+      - characterstringValue 12–14: holiday name, sunrise, sunset (ISO local strings)
+    """
+    zf = StatusFlags([0, 0, 0, 0])
+    common = {
+        "statusFlags": zf,
+        "eventState": EventState.normal,
+        "outOfService": Boolean(False),
+    }
+
+    def _bi(
+        instance: int,
+        name: str,
+        desc: str,
+        inactive: str,
+        active: str,
+    ) -> BinaryInputObject:
+        return BinaryInputObject(
+            objectIdentifier=ObjectIdentifier(f"binary-input,{instance}"),
+            objectName=CharacterString(name),
+            description=CharacterString(desc),
+            presentValue=BinaryPV.inactive,
+            polarity=Polarity.normal,
+            inactiveText=CharacterString(inactive),
+            activeText=CharacterString(active),
+            **common,
+        )
+
+    bi_ht = _bi(20, "Holiday-Today", "Site-local date is a public holiday (Nager.Date)", "No", "Yes")
+    bi_bd = _bi(21, "Business-Day", "Monday–Friday and not a public holiday", "No", "Yes")
+    bi_lw = _bi(22, "Long-Weekend", "Holiday on Fri/Sat/Sun or Monday holiday (coarse)", "No", "Yes")
+    bi_dw = _bi(23, "Daylight-Window", "Local time between sunrise and sunset", "Night", "Day")
+    bi_hok = _bi(24, "Holiday-API-OK", "Nager.Date fetch succeeded for configured country/year", "Offline", "Online")
+    bi_sok = _bi(25, "Sun-Data-OK", "Sunrise/sunset fetch succeeded", "Offline", "Online")
+
+    csv_hn = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,12"),
+        objectName=CharacterString("Holiday-Name"),
+        description=CharacterString("Public holiday name when Holiday-Today is active"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    csv_sr = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,13"),
+        objectName=CharacterString("Site-Sunrise-Time"),
+        description=CharacterString("Today sunrise (site-local ISO-8601 with offset)"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    csv_ss = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,14"),
+        objectName=CharacterString("Site-Sunset-Time"),
+        description=CharacterString("Today sunset (site-local ISO-8601 with offset)"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    return bi_ht, bi_bd, bi_lw, bi_dw, bi_hok, bi_sok, csv_hn, csv_sr, csv_ss
 
 
 def format_bacpypes_device_address(bind_ip: str, bind_prefix: int, udp_port: int) -> str:
@@ -2189,6 +2266,15 @@ class BacnetPypesClient:
         self._ai_site_weekday: Optional[AnalogInputObject] = None
         self._msi_site_weekday: Optional[_EdgeMultiStateInput] = None
         self._ai_site_utc_offset_min: Optional[AnalogInputObject] = None
+        self._bi_holiday_today: Optional[BinaryInputObject] = None
+        self._bi_business_day: Optional[BinaryInputObject] = None
+        self._bi_long_weekend: Optional[BinaryInputObject] = None
+        self._bi_daylight_window: Optional[BinaryInputObject] = None
+        self._bi_holiday_api_ok: Optional[BinaryInputObject] = None
+        self._bi_sun_data_ok: Optional[BinaryInputObject] = None
+        self._csv_holiday_name: Optional[_EdgeCharacterStringValue] = None
+        self._csv_site_sunrise: Optional[_EdgeCharacterStringValue] = None
+        self._csv_site_sunset: Optional[_EdgeCharacterStringValue] = None
         self._iam_response_effective: str = "unicast"
 
     def _build_application(self) -> Application:
@@ -2463,6 +2549,28 @@ class BacnetPypesClient:
         self._ai_site_weekday = ai_site_wd
         self._msi_site_weekday = msi_site_wd
         self._ai_site_utc_offset_min = ai_site_off
+        (
+            bi_ht,
+            bi_bd,
+            bi_lw,
+            bi_dw,
+            bi_hok,
+            bi_sok,
+            csv_hn,
+            csv_sr,
+            csv_ss,
+        ) = _create_schedule_context_objects()
+        for o in (bi_ht, bi_bd, bi_lw, bi_dw, bi_hok, bi_sok, csv_hn, csv_sr, csv_ss):
+            app.add_object(o)
+        self._bi_holiday_today = bi_ht
+        self._bi_business_day = bi_bd
+        self._bi_long_weekend = bi_lw
+        self._bi_daylight_window = bi_dw
+        self._bi_holiday_api_ok = bi_hok
+        self._bi_sun_data_ok = bi_sok
+        self._csv_holiday_name = csv_hn
+        self._csv_site_sunrise = csv_sr
+        self._csv_site_sunset = csv_ss
         self._iam_response_effective = self._effective.iam_response_mode
         _patch_whois_iam_response(app, self._iam_response_effective)
         return app
@@ -2801,6 +2909,63 @@ class BacnetPypesClient:
         _set_multistate_if_changed(self._msi_site_weekday, info.weekday_number)
         _set_real_if_changed(self._ai_site_utc_offset_min, float(info.utc_offset_minutes))
 
+    def update_schedule_context(
+        self,
+        info: SiteLocalTimeInfo,
+        holiday: HolidayEval,
+        sun: SunTimesResult,
+    ) -> None:
+        """Holiday + sun BACnet points; preserves CSV strings on sun failure."""
+        if (
+            self._bi_holiday_today is None
+            or self._bi_business_day is None
+            or self._bi_long_weekend is None
+            or self._bi_daylight_window is None
+            or self._bi_holiday_api_ok is None
+            or self._bi_sun_data_ok is None
+            or self._csv_holiday_name is None
+            or self._csv_site_sunrise is None
+            or self._csv_site_sunset is None
+        ):
+            return
+        if not info.ok:
+            self._bi_holiday_api_ok.presentValue = BinaryPV.inactive
+            self._bi_sun_data_ok.presentValue = BinaryPV.inactive
+            return
+
+        self._bi_holiday_today.presentValue = (
+            BinaryPV.active if holiday.holiday_today else BinaryPV.inactive
+        )
+        self._bi_business_day.presentValue = BinaryPV.active if holiday.business_day else BinaryPV.inactive
+        self._bi_long_weekend.presentValue = BinaryPV.active if holiday.long_weekend else BinaryPV.inactive
+        self._bi_holiday_api_ok.presentValue = (
+            BinaryPV.active if holiday.holiday_api_ok else BinaryPV.inactive
+        )
+        self._csv_holiday_name.presentValue = CharacterString(
+            _truncate_csv_text(holiday.holiday_name, 256)
+        )
+
+        if sun.fetch_ok and sun.sunrise_display.strip() and sun.sunset_display.strip():
+            self._csv_site_sunrise.presentValue = CharacterString(
+                _truncate_csv_text(sun.sunrise_display, 256)
+            )
+            self._csv_site_sunset.presentValue = CharacterString(
+                _truncate_csv_text(sun.sunset_display, 256)
+            )
+            self._bi_sun_data_ok.presentValue = BinaryPV.active
+            if info.local_datetime is not None:
+                dw = daylight_window_active(
+                    info.local_datetime,
+                    sun.sunrise_display,
+                    sun.sunset_display,
+                )
+                self._bi_daylight_window.presentValue = BinaryPV.active if dw else BinaryPV.inactive
+            else:
+                self._bi_daylight_window.presentValue = BinaryPV.inactive
+        else:
+            self._bi_sun_data_ok.presentValue = BinaryPV.inactive
+            self._bi_daylight_window.presentValue = BinaryPV.inactive
+
     async def start(self) -> None:
         if self._app is not None:
             return
@@ -2905,6 +3070,15 @@ class BacnetPypesClient:
         self._ai_site_weekday = None
         self._msi_site_weekday = None
         self._ai_site_utc_offset_min = None
+        self._bi_holiday_today = None
+        self._bi_business_day = None
+        self._bi_long_weekend = None
+        self._bi_daylight_window = None
+        self._bi_holiday_api_ok = None
+        self._bi_sun_data_ok = None
+        self._csv_holiday_name = None
+        self._csv_site_sunrise = None
+        self._csv_site_sunset = None
 
     async def restart(self, effective: EffectiveBacnetConfig) -> None:
         await self.stop()

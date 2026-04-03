@@ -54,7 +54,7 @@ class Settings(BaseSettings):
             return s
         return "unicast"
 
-    software_version: str = "0.1.17"
+    software_version: str = "0.1.18"
     who_is_timeout_seconds: float = 5.0
     read_device_live_max_objects: int = 500
     read_device_live_timeout_seconds: float = 120.0
@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     # Site-local BACnet time refresh (IANA zone from weather lat/lon; system UTC clock).
     # Default 1s so hour/minute/second points stay aligned with wall time; raise if COV/load is an issue.
     site_time_poll_interval_seconds: float = 1.0
+
+    # Holiday + sun BACnet points (Nager.Date + Open-Meteo); not every second.
+    schedule_context_poll_interval_seconds: float = 60.0
 
     @property
     def saas_base(self) -> str:

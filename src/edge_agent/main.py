@@ -7,6 +7,7 @@ import logging
 import socket
 import time
 import traceback
+from datetime import date
 from typing import Any, Optional, Union
 
 import httpx
@@ -15,6 +16,7 @@ from bacpypes3.apdu import ErrorRejectAbortNack
 from edge_agent.bacnet_client import BacnetPypesClient
 from edge_agent.job_runner import run_job
 from edge_agent.mock_bacnet_client import MockBacnetClient
+from edge_agent.holidays import HolidayEval, evaluate_holidays_for_local_date, load_public_holidays_year
 from edge_agent.models import (
     BacnetClient,
     ConfigPullResponse,
@@ -24,8 +26,9 @@ from edge_agent.models import (
     remote_weather_master_enabled,
     use_fahrenheit_from_tuning,
     utc_now_iso,
+    weather_coords_valid,
 )
-from edge_agent.open_meteo import fetch_current_weather
+from edge_agent.open_meteo import SunTimesResult, fetch_current_weather, fetch_daily_sunrise_sunset
 from edge_agent.open_meteo_air_quality import fetch_current_air_quality
 from edge_agent.saas_client import SaasClient
 from edge_agent.settings import Settings
@@ -298,6 +301,80 @@ async def _run_forever(settings: Settings) -> None:
                 _log.warning("site_time_update_failed err=%s", e)
             await asyncio.sleep(interval)
 
+    async def schedule_context_task() -> None:
+        """Public holidays (Nager.Date) + sunrise/sunset (Open-Meteo daily, fallback API)."""
+        while True:
+            tuning = storage.get_remote_agent_tuning()
+            interval = apply_float_tuning(
+                settings.schedule_context_poll_interval_seconds,
+                tuning,
+                "schedule_context_poll_interval_seconds",
+                30.0,
+                3600.0,
+            )
+            try:
+                if isinstance(bacnet, BacnetPypesClient):
+                    lat = tuning.weather_latitude if tuning else None
+                    lon = tuning.weather_longitude if tuning else None
+                    country = tuning.site_country_code if tuning else None
+                    info = get_local_time_info(lat, lon)
+                    tmo = min(30.0, float(settings.request_timeout_seconds))
+                    if not info.ok:
+                        bacnet.update_schedule_context(
+                            info,
+                            HolidayEval(
+                                holiday_today=False,
+                                holiday_name="",
+                                business_day=False,
+                                long_weekend=False,
+                                holiday_api_ok=False,
+                                error=info.error or "site_time_unavailable",
+                            ),
+                            SunTimesResult("", "", False, info.error or "site_time_unavailable"),
+                        )
+                        await asyncio.sleep(interval)
+                        continue
+
+                    d = date(info.year, info.month, info.day)
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(tmo), follow_redirects=True
+                    ) as http:
+                        hlist: Optional[list] = None
+                        hok = False
+                        herr = ""
+                        if country:
+                            hlist, hok, herr = await load_public_holidays_year(
+                                country,
+                                d.year,
+                                client=http,
+                                timeout_seconds=tmo,
+                            )
+                        hev = evaluate_holidays_for_local_date(
+                            country,
+                            d,
+                            info.weekday_number,
+                            hlist if hok else None,
+                            load_ok=hok,
+                            load_error=herr,
+                        )
+                        sun = SunTimesResult("", "", False, "skip")
+                        if (
+                            weather_coords_valid(lat, lon)
+                            and info.timezone_name
+                            and isinstance(info.timezone_name, str)
+                        ):
+                            sun = await fetch_daily_sunrise_sunset(
+                                float(lat),
+                                float(lon),
+                                info.timezone_name,
+                                info.local_date_iso,
+                                timeout_seconds=tmo,
+                            )
+                        bacnet.update_schedule_context(info, hev, sun)
+            except Exception as e:
+                _log.debug("schedule_context_failed err=%s", e)
+            await asyncio.sleep(interval)
+
     async def config_task() -> None:
         while True:
             await asyncio.sleep(
@@ -370,6 +447,7 @@ async def _run_forever(settings: Settings) -> None:
             edge_status_task(),
             weather_poll_task(),
             site_time_task(),
+            schedule_context_task(),
         )
     finally:
         await _stop_bacnet(bacnet)

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+SUNRISE_SUNSET_ORG_URL = "https://api.sunrise-sunset.org/json"
 
 _CURRENT_VARS = ",".join(
     [
@@ -59,6 +62,16 @@ class OpenMeteoResult:
     error: str
 
 
+@dataclass
+class SunTimesResult:
+    """Today's sunrise/sunset in site-local form for BACnet strings."""
+
+    sunrise_display: str
+    sunset_display: str
+    fetch_ok: bool
+    error: str
+
+
 def _bool_from_is_day(v: Any) -> bool:
     if isinstance(v, bool):
         return v
@@ -88,6 +101,203 @@ def _failed(error: str) -> OpenMeteoResult:
         fetch_ok=False,
         error=error,
     )
+
+
+def _failed_sun(msg: str) -> SunTimesResult:
+    return SunTimesResult(sunrise_display="", sunset_display="", fetch_ok=False, error=msg)
+
+
+def _fmt_local_iso(dt: datetime) -> str:
+    return dt.isoformat(timespec="seconds")
+
+
+async def fetch_daily_sunrise_sunset(
+    latitude: float,
+    longitude: float,
+    timezone_name: str,
+    local_date_iso: str,
+    *,
+    timeout_seconds: float = 20.0,
+) -> SunTimesResult:
+    """
+    Open-Meteo forecast ``daily=sunrise,sunset`` with ``timezone`` = IANA zone.
+    Picks the row where ``daily.time`` matches ``local_date_iso`` (YYYY-MM-DD).
+    Strings are site-local ISO-8601 with offset (seconds precision).
+    """
+    try:
+        params: dict[str, Any] = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "timezone": timezone_name,
+            "daily": "sunrise,sunset",
+            "forecast_days": 3,
+        }
+        timeout = httpx.Timeout(timeout_seconds)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            r = await client.get(OPEN_METEO_FORECAST_URL, params=params)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        return await _fetch_sunrise_sunset_org_fallback(
+            latitude,
+            longitude,
+            timezone_name,
+            local_date_iso,
+            timeout_seconds=timeout_seconds,
+            err=str(e) or type(e).__name__,
+        )
+
+    daily = data.get("daily") if isinstance(data, dict) else None
+    if not isinstance(daily, dict):
+        return await _fetch_sunrise_sunset_org_fallback(
+            latitude,
+            longitude,
+            timezone_name,
+            local_date_iso,
+            timeout_seconds=timeout_seconds,
+            err="no_daily",
+        )
+
+    times = daily.get("time")
+    rises = daily.get("sunrise")
+    sets = daily.get("sunset")
+    if not (isinstance(times, list) and isinstance(rises, list) and isinstance(sets, list)):
+        return await _fetch_sunrise_sunset_org_fallback(
+            latitude,
+            longitude,
+            timezone_name,
+            local_date_iso,
+            timeout_seconds=timeout_seconds,
+            err="daily_shape",
+        )
+
+    idx = None
+    for i, t in enumerate(times):
+        if isinstance(t, str) and t[:10] == local_date_iso[:10]:
+            idx = i
+            break
+    if idx is None or idx >= len(rises) or idx >= len(sets):
+        return await _fetch_sunrise_sunset_org_fallback(
+            latitude,
+            longitude,
+            timezone_name,
+            local_date_iso,
+            timeout_seconds=timeout_seconds,
+            err="no_row",
+        )
+
+    sr = rises[idx]
+    ss = sets[idx]
+    if not isinstance(sr, str) or not isinstance(ss, str):
+        return await _fetch_sunrise_sunset_org_fallback(
+            latitude,
+            longitude,
+            timezone_name,
+            local_date_iso,
+            timeout_seconds=timeout_seconds,
+            err="bad_cell",
+        )
+
+    try:
+        zi = ZoneInfo(timezone_name)
+    except Exception:
+        zi = ZoneInfo("UTC")
+
+    def _norm(s: str) -> str:
+        s = s.strip()
+        if "T" not in s:
+            return s
+        try:
+            if s.endswith("Z"):
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(zi)
+            else:
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=zi)
+                else:
+                    dt = dt.astimezone(zi)
+            return _fmt_local_iso(dt)
+        except Exception:
+            return s
+
+    return SunTimesResult(
+        sunrise_display=_norm(sr),
+        sunset_display=_norm(ss),
+        fetch_ok=True,
+        error="",
+    )
+
+
+async def _fetch_sunrise_sunset_org_fallback(
+    latitude: float,
+    longitude: float,
+    timezone_name: str,
+    local_date_iso: str,
+    *,
+    timeout_seconds: float,
+    err: str,
+) -> SunTimesResult:
+    """api.sunrise-sunset.org returns UTC ISO; convert to site zone."""
+    try:
+        zi = ZoneInfo(timezone_name)
+    except Exception:
+        return _failed_sun(f"tz:{err}")
+
+    try:
+        params = {
+            "lat": latitude,
+            "lng": longitude,
+            "formatted": 0,
+        }
+        timeout = httpx.Timeout(timeout_seconds)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            r = await client.get(SUNRISE_SUNSET_ORG_URL, params=params)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        return _failed_sun(f"{err}|fallback:{e}")
+
+    res = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(res, dict):
+        return _failed_sun(f"{err}|fallback_shape")
+
+    sr_raw = res.get("sunrise")
+    ss_raw = res.get("sunset")
+    if not isinstance(sr_raw, str) or not isinstance(ss_raw, str):
+        return _failed_sun(f"{err}|fallback_fields")
+
+    try:
+        sr_utc = datetime.fromisoformat(sr_raw.replace("Z", "+00:00"))
+        ss_utc = datetime.fromisoformat(ss_raw.replace("Z", "+00:00"))
+        sr_loc = sr_utc.astimezone(zi)
+        ss_loc = ss_utc.astimezone(zi)
+    except Exception as e:
+        return _failed_sun(f"{err}|fallback_parse:{e}")
+
+    return SunTimesResult(
+        sunrise_display=_fmt_local_iso(sr_loc),
+        sunset_display=_fmt_local_iso(ss_loc),
+        fetch_ok=True,
+        error="",
+    )
+
+
+def daylight_window_active(
+    now_local: datetime,
+    sunrise_display: str,
+    sunset_display: str,
+) -> bool:
+    """True if ``now_local`` is >= sunrise and < sunset (same calendar day)."""
+    try:
+        if "T" not in sunrise_display or "T" not in sunset_display:
+            return False
+        sr = datetime.fromisoformat(sunrise_display)
+        ss = datetime.fromisoformat(sunset_display)
+        if sr.tzinfo is None or ss.tzinfo is None:
+            return False
+        return sr <= now_local < ss
+    except Exception:
+        return False
 
 
 async def fetch_current_weather(
