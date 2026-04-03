@@ -58,7 +58,10 @@ from edge_agent.models import (
     EffectiveBacnetConfig,
     JobResultEnvelope,
     RemoteAgentTuning,
+    apply_float_tuning,
+    apply_int_tuning,
     desired_weather_polling_enabled_from_tuning,
+    remote_weather_master_enabled,
     use_fahrenheit_from_tuning,
     utc_now_iso,
 )
@@ -1311,6 +1314,220 @@ def _create_schedule_context_objects() -> tuple[
     return bi_ht, bi_bd, bi_lw, bi_dw, bi_hok, bi_sok, csv_hn, csv_sr, csv_ss
 
 
+def _create_agent_config_snapshot_objects() -> tuple[
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    _EdgeCharacterStringValue,
+]:
+    """
+    Read-only mirror of effective SaaS ``agent`` tuning + env defaults (job / weather / site timers).
+
+    Instance reservation (gap analog-input 21–33 before AQ block 34–42; BI 26–28; CSV 15):
+      - analog-input 21–32: poll + heartbeat + config + edge status + Who-Is + read-device limits
+        + weather lat/lon + weather/site/schedule poll intervals
+      - analog-input 33: SaaS online threshold (edge status BI; env only, not in agent JSON)
+      - binary-input 26–28: weather master active (enabled + coords), display °F, polling desired
+      - characterstringValue 15: site country code (ISO 3166-1 alpha-2) for holidays
+    """
+    zf = StatusFlags([0, 0, 0, 0])
+    common = {
+        "statusFlags": zf,
+        "eventState": EventState.normal,
+        "outOfService": Boolean(False),
+    }
+
+    def _ai(
+        instance: int,
+        name: str,
+        desc: str,
+        units: EngineeringUnits,
+        cov: float,
+    ) -> AnalogInputObject:
+        return AnalogInputObject(
+            objectIdentifier=ObjectIdentifier(f"analog-input,{instance}"),
+            objectName=CharacterString(name),
+            description=CharacterString(desc),
+            presentValue=Real(0.0),
+            covIncrement=Real(float(cov)),
+            units=units,
+            **common,
+        )
+
+    ai_poll = _ai(
+        21,
+        "Agent-JobPollInterval",
+        "Effective job poll interval (seconds)",
+        EngineeringUnits.seconds,
+        0.5,
+    )
+    ai_hb = _ai(
+        22,
+        "Agent-HeartbeatInterval",
+        "Effective SaaS heartbeat interval (seconds)",
+        EngineeringUnits.seconds,
+        0.5,
+    )
+    ai_cfg = _ai(
+        23,
+        "Agent-ConfigPollInterval",
+        "Effective remote config poll interval (seconds)",
+        EngineeringUnits.seconds,
+        0.5,
+    )
+    ai_edge = _ai(
+        24,
+        "Agent-EdgeStatusInterval",
+        "Effective edge status / uptime refresh interval (seconds)",
+        EngineeringUnits.seconds,
+        0.5,
+    )
+    ai_who = _ai(
+        25,
+        "Agent-WhoIsTimeout",
+        "Effective Who-Is timeout for discovery jobs (seconds)",
+        EngineeringUnits.seconds,
+        0.1,
+    )
+    ai_rmax = _ai(
+        26,
+        "Agent-ReadDeviceLiveMaxObjects",
+        "Effective max objects per read_device_live job (dimensionless)",
+        EngineeringUnits.noUnits,
+        1.0,
+    )
+    ai_rtmo = _ai(
+        27,
+        "Agent-ReadDeviceLiveTimeout",
+        "Effective read_device_live deadline (seconds)",
+        EngineeringUnits.seconds,
+        0.5,
+    )
+    ai_lat = _ai(
+        28,
+        "Agent-Weather-Latitude",
+        "SaaS weather latitude (decimal degrees; 0 if unset)",
+        EngineeringUnits.noUnits,
+        1e-4,
+    )
+    ai_lon = _ai(
+        29,
+        "Agent-Weather-Longitude",
+        "SaaS weather longitude (decimal degrees; 0 if unset)",
+        EngineeringUnits.noUnits,
+        1e-4,
+    )
+    ai_wxp = _ai(
+        30,
+        "Agent-WeatherPollInterval",
+        "Effective Open-Meteo poll interval (seconds)",
+        EngineeringUnits.seconds,
+        1.0,
+    )
+    ai_st = _ai(
+        31,
+        "Agent-SiteTimePollInterval",
+        "Effective site-local time BACnet refresh interval (seconds)",
+        EngineeringUnits.seconds,
+        0.1,
+    )
+    ai_sch = _ai(
+        32,
+        "Agent-ScheduleContextPollInterval",
+        "Effective holiday + sun schedule poll interval (seconds)",
+        EngineeringUnits.seconds,
+        0.5,
+    )
+    ai_saas_thr = _ai(
+        33,
+        "Agent-SaaSOnlineThreshold",
+        "Heartbeat staleness window for Edge-SaaS BI (seconds; env)",
+        EngineeringUnits.seconds,
+        0.5,
+    )
+
+    def _bi(
+        instance: int,
+        name: str,
+        desc: str,
+        inactive: str,
+        active: str,
+    ) -> BinaryInputObject:
+        return BinaryInputObject(
+            objectIdentifier=ObjectIdentifier(f"binary-input,{instance}"),
+            objectName=CharacterString(name),
+            description=CharacterString(desc),
+            presentValue=BinaryPV.inactive,
+            polarity=Polarity.normal,
+            inactiveText=CharacterString(inactive),
+            activeText=CharacterString(active),
+            **common,
+        )
+
+    bi_wx_ok = _bi(
+        26,
+        "Agent-Weather-Master-Active",
+        "SaaS weather_enabled and valid lat/lon (same gate as weather poll task)",
+        "No",
+        "Yes",
+    )
+    bi_wx_f = _bi(
+        27,
+        "Agent-Weather-Display-Fahrenheit",
+        "SaaS temperature display: inactive=Celsius, active=Fahrenheit",
+        "Celsius",
+        "Fahrenheit",
+    )
+    bi_wx_poll = _bi(
+        28,
+        "Agent-Weather-Polling-Desired",
+        "SaaS default for Weather-Polling BV when key omitted (read-only mirror)",
+        "No",
+        "Yes",
+    )
+
+    csv_cc = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,15"),
+        objectName=CharacterString("Agent-SiteCountryCode"),
+        description=CharacterString("ISO 3166-1 alpha-2 for Nager.Date holidays (empty if unset)"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+
+    return (
+        ai_poll,
+        ai_hb,
+        ai_cfg,
+        ai_edge,
+        ai_who,
+        ai_rmax,
+        ai_rtmo,
+        ai_lat,
+        ai_lon,
+        ai_wxp,
+        ai_st,
+        ai_sch,
+        ai_saas_thr,
+        bi_wx_ok,
+        bi_wx_f,
+        bi_wx_poll,
+        csv_cc,
+    )
+
+
 def format_bacpypes_device_address(bind_ip: str, bind_prefix: int, udp_port: int) -> str:
     """
     BACpypes3 parses bare ip:port as /32; then addrBroadcastTuple == addrTuple and
@@ -2275,6 +2492,23 @@ class BacnetPypesClient:
         self._csv_holiday_name: Optional[_EdgeCharacterStringValue] = None
         self._csv_site_sunrise: Optional[_EdgeCharacterStringValue] = None
         self._csv_site_sunset: Optional[_EdgeCharacterStringValue] = None
+        self._ai_agent_poll_interval: Optional[AnalogInputObject] = None
+        self._ai_agent_heartbeat_interval: Optional[AnalogInputObject] = None
+        self._ai_agent_config_poll_interval: Optional[AnalogInputObject] = None
+        self._ai_agent_edge_status_interval: Optional[AnalogInputObject] = None
+        self._ai_agent_who_is_timeout: Optional[AnalogInputObject] = None
+        self._ai_agent_read_device_max: Optional[AnalogInputObject] = None
+        self._ai_agent_read_device_timeout: Optional[AnalogInputObject] = None
+        self._ai_agent_weather_latitude: Optional[AnalogInputObject] = None
+        self._ai_agent_weather_longitude: Optional[AnalogInputObject] = None
+        self._ai_agent_weather_poll_interval: Optional[AnalogInputObject] = None
+        self._ai_agent_site_time_poll_interval: Optional[AnalogInputObject] = None
+        self._ai_agent_schedule_context_poll_interval: Optional[AnalogInputObject] = None
+        self._ai_agent_saas_online_threshold: Optional[AnalogInputObject] = None
+        self._bi_agent_weather_master_active: Optional[BinaryInputObject] = None
+        self._bi_agent_weather_display_fahrenheit: Optional[BinaryInputObject] = None
+        self._bi_agent_weather_polling_desired: Optional[BinaryInputObject] = None
+        self._csv_agent_site_country_code: Optional[_EdgeCharacterStringValue] = None
         self._iam_response_effective: str = "unicast"
 
     def _build_application(self) -> Application:
@@ -2571,6 +2805,63 @@ class BacnetPypesClient:
         self._csv_holiday_name = csv_hn
         self._csv_site_sunrise = csv_sr
         self._csv_site_sunset = csv_ss
+        (
+            ai_apoll,
+            ai_ahb,
+            ai_acfg,
+            ai_aedge,
+            ai_awho,
+            ai_armax,
+            ai_artmo,
+            ai_alat,
+            ai_alon,
+            ai_awxp,
+            ai_ast,
+            ai_asch,
+            ai_athr,
+            bi_amaster,
+            bi_afahr,
+            bi_apdesired,
+            csv_acc,
+        ) = _create_agent_config_snapshot_objects()
+        for o in (
+            ai_apoll,
+            ai_ahb,
+            ai_acfg,
+            ai_aedge,
+            ai_awho,
+            ai_armax,
+            ai_artmo,
+            ai_alat,
+            ai_alon,
+            ai_awxp,
+            ai_ast,
+            ai_asch,
+            ai_athr,
+            bi_amaster,
+            bi_afahr,
+            bi_apdesired,
+            csv_acc,
+        ):
+            app.add_object(o)
+        self._ai_agent_poll_interval = ai_apoll
+        self._ai_agent_heartbeat_interval = ai_ahb
+        self._ai_agent_config_poll_interval = ai_acfg
+        self._ai_agent_edge_status_interval = ai_aedge
+        self._ai_agent_who_is_timeout = ai_awho
+        self._ai_agent_read_device_max = ai_armax
+        self._ai_agent_read_device_timeout = ai_artmo
+        self._ai_agent_weather_latitude = ai_alat
+        self._ai_agent_weather_longitude = ai_alon
+        self._ai_agent_weather_poll_interval = ai_awxp
+        self._ai_agent_site_time_poll_interval = ai_ast
+        self._ai_agent_schedule_context_poll_interval = ai_asch
+        self._ai_agent_saas_online_threshold = ai_athr
+        self._bi_agent_weather_master_active = bi_amaster
+        self._bi_agent_weather_display_fahrenheit = bi_afahr
+        self._bi_agent_weather_polling_desired = bi_apdesired
+        self._csv_agent_site_country_code = csv_acc
+        self.update_agent_config_snapshot()
         self._iam_response_effective = self._effective.iam_response_mode
         _patch_whois_iam_response(app, self._iam_response_effective)
         return app
@@ -2581,6 +2872,116 @@ class BacnetPypesClient:
             return
         self._bi_internet.presentValue = BinaryPV.active if internet_ok else BinaryPV.inactive
         self._bi_saas.presentValue = BinaryPV.active if saas_ok else BinaryPV.inactive
+
+    def update_agent_config_snapshot(self) -> None:
+        """Refresh Agent-* analog/binary/CSV points to match effective SaaS tuning + env defaults."""
+        if self._ai_agent_poll_interval is None:
+            return
+        s = self._settings
+        tuning = self._storage.get_remote_agent_tuning()
+        self._ai_agent_poll_interval.presentValue = Real(
+            apply_float_tuning(s.poll_interval_seconds, tuning, "poll_interval_seconds", 1.0, 120.0)
+        )
+        self._ai_agent_heartbeat_interval.presentValue = Real(
+            apply_float_tuning(
+                s.heartbeat_interval_seconds, tuning, "heartbeat_interval_seconds", 10.0, 600.0
+            )
+        )
+        self._ai_agent_config_poll_interval.presentValue = Real(
+            apply_float_tuning(
+                s.config_poll_interval_seconds, tuning, "config_poll_interval_seconds", 15.0, 3600.0
+            )
+        )
+        self._ai_agent_edge_status_interval.presentValue = Real(
+            apply_float_tuning(
+                s.edge_status_check_interval_seconds,
+                tuning,
+                "edge_status_check_interval_seconds",
+                5.0,
+                600.0,
+            )
+        )
+        self._ai_agent_who_is_timeout.presentValue = Real(
+            apply_float_tuning(s.who_is_timeout_seconds, tuning, "who_is_timeout_seconds", 1.0, 120.0)
+        )
+        self._ai_agent_read_device_max.presentValue = Real(
+            float(
+                apply_int_tuning(
+                    s.read_device_live_max_objects,
+                    tuning,
+                    "read_device_live_max_objects",
+                    1,
+                    10000,
+                )
+            )
+        )
+        self._ai_agent_read_device_timeout.presentValue = Real(
+            apply_float_tuning(
+                s.read_device_live_timeout_seconds,
+                tuning,
+                "read_device_live_timeout_seconds",
+                10.0,
+                600.0,
+            )
+        )
+        lat = 0.0
+        lon = 0.0
+        if tuning is not None:
+            if tuning.weather_latitude is not None:
+                lat = float(tuning.weather_latitude)
+            if tuning.weather_longitude is not None:
+                lon = float(tuning.weather_longitude)
+        self._ai_agent_weather_latitude.presentValue = Real(lat)
+        self._ai_agent_weather_longitude.presentValue = Real(lon)
+        self._ai_agent_weather_poll_interval.presentValue = Real(
+            apply_float_tuning(
+                s.weather_poll_interval_seconds,
+                tuning,
+                "weather_poll_interval_seconds",
+                900.0,
+                3600.0,
+            )
+        )
+        self._ai_agent_site_time_poll_interval.presentValue = Real(
+            apply_float_tuning(
+                s.site_time_poll_interval_seconds,
+                tuning,
+                "site_time_poll_interval_seconds",
+                1.0,
+                3600.0,
+            )
+        )
+        self._ai_agent_schedule_context_poll_interval.presentValue = Real(
+            apply_float_tuning(
+                s.schedule_context_poll_interval_seconds,
+                tuning,
+                "schedule_context_poll_interval_seconds",
+                30.0,
+                3600.0,
+            )
+        )
+        self._ai_agent_saas_online_threshold.presentValue = Real(float(s.saas_online_threshold_seconds))
+        if self._bi_agent_weather_master_active is not None:
+            self._bi_agent_weather_master_active.presentValue = (
+                BinaryPV.active if remote_weather_master_enabled(tuning) else BinaryPV.inactive
+            )
+        if self._bi_agent_weather_display_fahrenheit is not None:
+            self._bi_agent_weather_display_fahrenheit.presentValue = (
+                BinaryPV.active if use_fahrenheit_from_tuning(tuning) else BinaryPV.inactive
+            )
+        if self._bi_agent_weather_polling_desired is not None:
+            self._bi_agent_weather_polling_desired.presentValue = (
+                BinaryPV.active
+                if desired_weather_polling_enabled_from_tuning(tuning)
+                else BinaryPV.inactive
+            )
+        if self._csv_agent_site_country_code is not None:
+            cc = ""
+            if tuning is not None and tuning.site_country_code:
+                cc = str(tuning.site_country_code).strip().upper()
+            self._csv_agent_site_country_code.presentValue = CharacterString(
+                _truncate_csv_text(cc, 8)
+            )
 
     def update_agent_uptime_seconds(self, uptime_seconds: float) -> None:
         """Analog-input Edge-Uptime: present value in seconds."""
@@ -3079,6 +3480,23 @@ class BacnetPypesClient:
         self._csv_holiday_name = None
         self._csv_site_sunrise = None
         self._csv_site_sunset = None
+        self._ai_agent_poll_interval = None
+        self._ai_agent_heartbeat_interval = None
+        self._ai_agent_config_poll_interval = None
+        self._ai_agent_edge_status_interval = None
+        self._ai_agent_who_is_timeout = None
+        self._ai_agent_read_device_max = None
+        self._ai_agent_read_device_timeout = None
+        self._ai_agent_weather_latitude = None
+        self._ai_agent_weather_longitude = None
+        self._ai_agent_weather_poll_interval = None
+        self._ai_agent_site_time_poll_interval = None
+        self._ai_agent_schedule_context_poll_interval = None
+        self._ai_agent_saas_online_threshold = None
+        self._bi_agent_weather_master_active = None
+        self._bi_agent_weather_display_fahrenheit = None
+        self._bi_agent_weather_polling_desired = None
+        self._csv_agent_site_country_code = None
 
     async def restart(self, effective: EffectiveBacnetConfig) -> None:
         await self.stop()
