@@ -283,7 +283,7 @@ async def _run_forever(settings: Settings) -> None:
                 settings.site_time_poll_interval_seconds,
                 tuning,
                 "site_time_poll_interval_seconds",
-                30.0,
+                1.0,
                 3600.0,
             )
             try:

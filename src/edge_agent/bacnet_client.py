@@ -144,6 +144,39 @@ def _truncate_csv_text(s: str, max_len: int = 400) -> str:
     return t
 
 
+def _character_string_pv_as_str(obj: Any) -> str:
+    """String form of presentValue for local character-string objects (avoid spurious BACnet writes)."""
+    pv = getattr(obj, "presentValue", None)
+    if pv is None:
+        return ""
+    return str(pv)
+
+
+def _set_character_string_if_changed(
+    obj: _EdgeCharacterStringValue, text: str, max_len: int = 400
+) -> None:
+    t = _truncate_csv_text(text, max_len)
+    if _character_string_pv_as_str(obj) == t:
+        return
+    obj.presentValue = CharacterString(t)
+
+
+def _set_real_if_changed(obj: AnalogInputObject, value: float) -> None:
+    try:
+        cur = float(obj.presentValue)
+    except Exception:
+        cur = None
+    if cur is not None and abs(cur - value) < 1e-5:
+        return
+    obj.presentValue = Real(float(value))
+
+
+def _set_binary_if_changed(obj: BinaryInputObject, pv: BinaryPV) -> None:
+    if obj.presentValue == pv:
+        return
+    obj.presentValue = pv
+
+
 def _create_agent_telemetry_objects() -> tuple[
     AnalogInputObject,
     _EdgeCharacterStringValue,
@@ -2140,30 +2173,27 @@ class BacnetPypesClient:
         ):
             return
         if not info.ok:
-            self._bi_site_time_ok.presentValue = BinaryPV.inactive
-            self._bi_site_dst.presentValue = BinaryPV.inactive
+            _set_binary_if_changed(self._bi_site_time_ok, BinaryPV.inactive)
+            _set_binary_if_changed(self._bi_site_dst, BinaryPV.inactive)
             return
-        self._bi_site_time_ok.presentValue = BinaryPV.active
-        self._bi_site_dst.presentValue = BinaryPV.active if info.is_dst else BinaryPV.inactive
+        _set_binary_if_changed(self._bi_site_time_ok, BinaryPV.active)
+        _set_binary_if_changed(
+            self._bi_site_dst,
+            BinaryPV.active if info.is_dst else BinaryPV.inactive,
+        )
         tz_label = (info.timezone_name or "").strip() or "unknown"
-        self._csv_site_tz.presentValue = CharacterString(_truncate_csv_text(tz_label, 256))
-        self._csv_site_local_dt.presentValue = CharacterString(
-            _truncate_csv_text(info.local_datetime_iso, 400)
-        )
-        self._csv_site_date.presentValue = CharacterString(
-            _truncate_csv_text(info.local_date_iso, 32)
-        )
-        self._csv_site_time.presentValue = CharacterString(
-            _truncate_csv_text(info.local_time_iso, 32)
-        )
-        self._ai_site_year.presentValue = Real(float(info.year))
-        self._ai_site_month.presentValue = Real(float(info.month))
-        self._ai_site_day.presentValue = Real(float(info.day))
-        self._ai_site_hour.presentValue = Real(float(info.hour))
-        self._ai_site_minute.presentValue = Real(float(info.minute))
-        self._ai_site_second.presentValue = Real(float(info.second))
-        self._ai_site_weekday.presentValue = Real(float(info.weekday_number))
-        self._ai_site_utc_offset_min.presentValue = Real(float(info.utc_offset_minutes))
+        _set_character_string_if_changed(self._csv_site_tz, tz_label, 256)
+        _set_character_string_if_changed(self._csv_site_local_dt, info.local_datetime_iso, 400)
+        _set_character_string_if_changed(self._csv_site_date, info.local_date_iso, 32)
+        _set_character_string_if_changed(self._csv_site_time, info.local_time_iso, 32)
+        _set_real_if_changed(self._ai_site_year, float(info.year))
+        _set_real_if_changed(self._ai_site_month, float(info.month))
+        _set_real_if_changed(self._ai_site_day, float(info.day))
+        _set_real_if_changed(self._ai_site_hour, float(info.hour))
+        _set_real_if_changed(self._ai_site_minute, float(info.minute))
+        _set_real_if_changed(self._ai_site_second, float(info.second))
+        _set_real_if_changed(self._ai_site_weekday, float(info.weekday_number))
+        _set_real_if_changed(self._ai_site_utc_offset_min, float(info.utc_offset_minutes))
 
     async def start(self) -> None:
         if self._app is not None:
