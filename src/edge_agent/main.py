@@ -17,6 +17,12 @@ from edge_agent.bacnet_client import BacnetPypesClient
 from edge_agent.job_runner import run_job
 from edge_agent.mock_bacnet_client import MockBacnetClient
 from edge_agent.holidays import HolidayEval, evaluate_holidays_for_local_date, load_public_holidays_year
+from edge_agent.iss_tracker import (
+    IssPositionResult,
+    fetch_iss_position,
+    fetch_next_iss_pass,
+    format_pass_risetime_site_local,
+)
 from edge_agent.models import (
     BacnetClient,
     ConfigPullResponse,
@@ -32,7 +38,7 @@ from edge_agent.open_meteo import SunTimesResult, fetch_current_weather, fetch_d
 from edge_agent.open_meteo_air_quality import fetch_current_air_quality
 from edge_agent.saas_client import SaasClient
 from edge_agent.settings import Settings
-from edge_agent.site_time import get_local_time_info
+from edge_agent.site_time import get_local_time_info, resolve_timezone_name
 from edge_agent.storage import Storage
 
 _log = logging.getLogger(__name__)
@@ -380,6 +386,73 @@ async def _run_forever(settings: Settings) -> None:
                 _log.debug("schedule_context_failed err=%s", e)
             await asyncio.sleep(interval)
 
+    async def iss_poll_task() -> None:
+        """Novelty ISS position + infrequent pass prediction; uses weather lat/lon only."""
+        last_pass_mono: float = 0.0
+        while True:
+            interval = max(
+                60.0,
+                min(300.0, float(settings.iss_poll_interval_seconds)),
+            )
+            pass_refresh = max(
+                300.0,
+                float(settings.iss_pass_refresh_interval_seconds),
+            )
+            try:
+                if isinstance(bacnet, BacnetPypesClient):
+                    tuning = storage.get_remote_agent_tuning()
+                    lat = tuning.weather_latitude if tuning else None
+                    lon = tuning.weather_longitude if tuning else None
+                    if not weather_coords_valid(lat, lon):
+                        bacnet.update_iss(
+                            IssPositionResult(
+                                ok=False,
+                                error="no_site_coordinates",
+                                timestamp_utc="",
+                                iss_latitude=0.0,
+                                iss_longitude=0.0,
+                                iss_altitude_km=0.0,
+                                iss_velocity_kph=0.0,
+                                distance_to_site_km=0.0,
+                                overhead_now=False,
+                            ),
+                            pass_risetime_display="",
+                            pass_duration_sec=0.0,
+                            update_pass_points=False,
+                            use_imperial=use_fahrenheit_from_tuning(tuning),
+                        )
+                    else:
+                        la = float(lat)
+                        lo = float(lon)
+                        tmo = min(15.0, float(settings.request_timeout_seconds))
+                        pos = await fetch_iss_position(la, lo, tmo)
+                        tz_name = resolve_timezone_name(la, lo)
+                        now_m = time.monotonic()
+                        do_pass = (now_m - last_pass_mono) >= pass_refresh
+                        pass_disp = ""
+                        pass_dur = 0.0
+                        update_pass = False
+                        if do_pass:
+                            last_pass_mono = now_m
+                            p = await fetch_next_iss_pass(la, lo, tmo)
+                            if p.ok:
+                                pass_disp = format_pass_risetime_site_local(
+                                    p.next_risetime_unix,
+                                    tz_name,
+                                )
+                                pass_dur = p.duration_seconds
+                                update_pass = True
+                        bacnet.update_iss(
+                            pos,
+                            pass_risetime_display=pass_disp,
+                            pass_duration_sec=pass_dur,
+                            update_pass_points=update_pass,
+                            use_imperial=use_fahrenheit_from_tuning(tuning),
+                        )
+            except Exception as e:
+                _log.debug("iss_poll_failed err=%s", e)
+            await asyncio.sleep(interval)
+
     async def config_task() -> None:
         while True:
             await asyncio.sleep(
@@ -453,6 +526,7 @@ async def _run_forever(settings: Settings) -> None:
             weather_poll_task(),
             site_time_task(),
             schedule_context_task(),
+            iss_poll_task(),
         )
     finally:
         await _stop_bacnet(bacnet)

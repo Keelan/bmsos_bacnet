@@ -54,7 +54,7 @@ class Settings(BaseSettings):
             return s
         return "unicast"
 
-    software_version: str = "0.1.20"
+    software_version: str = "0.1.23"
     who_is_timeout_seconds: float = 5.0
     read_device_live_max_objects: int = 500
     read_device_live_timeout_seconds: float = 120.0
@@ -76,6 +76,10 @@ class Settings(BaseSettings):
 
     # Holiday + sun BACnet points (Nager.Date + Open-Meteo); not every second.
     schedule_context_poll_interval_seconds: float = 60.0
+
+    # ISS novelty points (wheretheiss.at + optional Open Notify); no BAS control use.
+    iss_poll_interval_seconds: float = 120.0
+    iss_pass_refresh_interval_seconds: float = 1800.0
 
     @property
     def saas_base(self) -> str:

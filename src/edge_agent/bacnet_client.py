@@ -72,6 +72,12 @@ from edge_agent.holidays import HolidayEval
 from edge_agent.open_meteo import SunTimesResult, daylight_window_active
 from edge_agent.site_time import SiteLocalTimeInfo
 from edge_agent.storage import Storage
+from edge_agent.iss_tracker import (
+    IssPositionResult,
+    iss_altitude_for_bacnet,
+    iss_distance_for_bacnet,
+    iss_velocity_for_bacnet,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -1528,6 +1534,167 @@ def _create_agent_config_snapshot_objects() -> tuple[
     )
 
 
+def _create_iss_awareness_objects(imperial: bool) -> tuple[
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    AnalogInputObject,
+    BinaryInputObject,
+    BinaryInputObject,
+    _EdgeCharacterStringValue,
+    _EdgeCharacterStringValue,
+]:
+    """
+    Novelty ISS awareness (not used for BAS control).
+
+    Instance reservation (no overlap with AI 1–50, BI 1–28, CSV 1–15):
+      - analog-input 51–56: distance, ISS lat/lon (deg), altitude, velocity,
+        next-pass duration seconds
+      - Metric: distance km, altitude km, velocity km/h (matches wheretheiss.at).
+      - Imperial (``weather_temperature_unit`` / same bundle as weather °F): distance and altitude ft,
+        velocity mph (no BACnet ``miles`` unit for horizontal distance).
+      - binary-input 29–30: overhead proximity flag, data-OK
+      - characterstringValue 16–17: last position update / error, next pass (site-local ISO)
+    """
+    zf = StatusFlags([0, 0, 0, 0])
+    common = {
+        "statusFlags": zf,
+        "eventState": EventState.normal,
+        "outOfService": Boolean(False),
+    }
+
+    def _ai(
+        instance: int,
+        name: str,
+        desc: str,
+        units: EngineeringUnits,
+        cov: float,
+    ) -> AnalogInputObject:
+        return AnalogInputObject(
+            objectIdentifier=ObjectIdentifier(f"analog-input,{instance}"),
+            objectName=CharacterString(name),
+            description=CharacterString(desc),
+            presentValue=Real(0.0),
+            covIncrement=Real(float(cov)),
+            units=units,
+            **common,
+        )
+
+    dist_units = EngineeringUnits.feet if imperial else EngineeringUnits.kilometers
+    dist_desc = (
+        "Great-circle distance site to ISS subsatellite point (feet); novelty only"
+        if imperial
+        else "Great-circle distance site to ISS subsatellite point (km); novelty only"
+    )
+    ai_dist = _ai(
+        51,
+        "ISS-Distance",
+        dist_desc,
+        dist_units,
+        500.0 if imperial else 1.0,
+    )
+    ai_iss_lat = _ai(
+        52,
+        "ISS-Latitude",
+        "ISS latitude (decimal degrees)",
+        EngineeringUnits.noUnits,
+        0.01,
+    )
+    ai_iss_lon = _ai(
+        53,
+        "ISS-Longitude",
+        "ISS longitude (decimal degrees)",
+        EngineeringUnits.noUnits,
+        0.01,
+    )
+    alt_units = EngineeringUnits.feet if imperial else EngineeringUnits.kilometers
+    alt_desc = (
+        "ISS altitude above Earth (feet); novelty only"
+        if imperial
+        else "ISS altitude above Earth (km); novelty only"
+    )
+    ai_alt = _ai(
+        54,
+        "ISS-Altitude",
+        alt_desc,
+        alt_units,
+        500.0 if imperial else 0.5,
+    )
+    vel_units = EngineeringUnits.milesPerHour if imperial else EngineeringUnits.kilometersPerHour
+    vel_desc = (
+        "ISS ground-track speed (mph); novelty only"
+        if imperial
+        else "ISS ground-track speed (km/h); novelty only"
+    )
+    ai_vel = _ai(
+        55,
+        "ISS-Velocity",
+        vel_desc,
+        vel_units,
+        10.0,
+    )
+    ai_pass_dur = _ai(
+        56,
+        "ISS-Next-Pass-Duration",
+        "Predicted duration of next overhead pass (seconds); Open Notify",
+        EngineeringUnits.seconds,
+        1.0,
+    )
+
+    bi_over = BinaryInputObject(
+        objectIdentifier=ObjectIdentifier("binary-input,29"),
+        objectName=CharacterString("ISS-Overhead-Now"),
+        description=CharacterString(
+            "Active when ISS ground track within ~750 km of site (not visibility); "
+            "threshold fixed in km; wheretheiss.at"
+        ),
+        presentValue=BinaryPV.inactive,
+        polarity=Polarity.normal,
+        inactiveText=CharacterString("No"),
+        activeText=CharacterString("Yes"),
+        **common,
+    )
+    bi_ok = BinaryInputObject(
+        objectIdentifier=ObjectIdentifier("binary-input,30"),
+        objectName=CharacterString("ISS-Data-OK"),
+        description=CharacterString("Last ISS position fetch from wheretheiss.at succeeded"),
+        presentValue=BinaryPV.inactive,
+        polarity=Polarity.normal,
+        inactiveText=CharacterString("Offline"),
+        activeText=CharacterString("Online"),
+        **common,
+    )
+    csv_last = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,16"),
+        objectName=CharacterString("ISS-Last-Update"),
+        description=CharacterString("Last ISS position sample ISO UTC or error text"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+    csv_next = _EdgeCharacterStringValue(
+        objectIdentifier=ObjectIdentifier("characterstringValue,17"),
+        objectName=CharacterString("ISS-Next-Pass-Time"),
+        description=CharacterString("Next pass start (site-local ISO when zone known, else UTC)"),
+        presentValue=CharacterString(""),
+        **common,
+    )
+
+    return (
+        ai_dist,
+        ai_iss_lat,
+        ai_iss_lon,
+        ai_alt,
+        ai_vel,
+        ai_pass_dur,
+        bi_over,
+        bi_ok,
+        csv_last,
+        csv_next,
+    )
+
+
 def format_bacpypes_device_address(bind_ip: str, bind_prefix: int, udp_port: int) -> str:
     """
     BACpypes3 parses bare ip:port as /32; then addrBroadcastTuple == addrTuple and
@@ -2509,6 +2676,16 @@ class BacnetPypesClient:
         self._bi_agent_weather_display_fahrenheit: Optional[BinaryInputObject] = None
         self._bi_agent_weather_polling_desired: Optional[BinaryInputObject] = None
         self._csv_agent_site_country_code: Optional[_EdgeCharacterStringValue] = None
+        self._ai_iss_distance: Optional[AnalogInputObject] = None
+        self._ai_iss_latitude: Optional[AnalogInputObject] = None
+        self._ai_iss_longitude: Optional[AnalogInputObject] = None
+        self._ai_iss_altitude: Optional[AnalogInputObject] = None
+        self._ai_iss_velocity: Optional[AnalogInputObject] = None
+        self._ai_iss_pass_duration: Optional[AnalogInputObject] = None
+        self._bi_iss_overhead: Optional[BinaryInputObject] = None
+        self._bi_iss_data_ok: Optional[BinaryInputObject] = None
+        self._csv_iss_last_update: Optional[_EdgeCharacterStringValue] = None
+        self._csv_iss_next_pass: Optional[_EdgeCharacterStringValue] = None
         self._iam_response_effective: str = "unicast"
 
     def _build_application(self) -> Application:
@@ -2861,6 +3038,41 @@ class BacnetPypesClient:
         self._bi_agent_weather_display_fahrenheit = bi_afahr
         self._bi_agent_weather_polling_desired = bi_apdesired
         self._csv_agent_site_country_code = csv_acc
+        (
+            ai_iss_d,
+            ai_iss_ila,
+            ai_iss_ilo,
+            ai_iss_alt,
+            ai_iss_vel,
+            ai_iss_pdur,
+            bi_iss_ov,
+            bi_iss_ok,
+            csv_iss_lu,
+            csv_iss_np,
+        ) = _create_iss_awareness_objects(use_fahrenheit_from_tuning(wx_tuning))
+        for o in (
+            ai_iss_d,
+            ai_iss_ila,
+            ai_iss_ilo,
+            ai_iss_alt,
+            ai_iss_vel,
+            ai_iss_pdur,
+            bi_iss_ov,
+            bi_iss_ok,
+            csv_iss_lu,
+            csv_iss_np,
+        ):
+            app.add_object(o)
+        self._ai_iss_distance = ai_iss_d
+        self._ai_iss_latitude = ai_iss_ila
+        self._ai_iss_longitude = ai_iss_ilo
+        self._ai_iss_altitude = ai_iss_alt
+        self._ai_iss_velocity = ai_iss_vel
+        self._ai_iss_pass_duration = ai_iss_pdur
+        self._bi_iss_overhead = bi_iss_ov
+        self._bi_iss_data_ok = bi_iss_ok
+        self._csv_iss_last_update = csv_iss_lu
+        self._csv_iss_next_pass = csv_iss_np
         self.update_agent_config_snapshot()
         self._iam_response_effective = self._effective.iam_response_mode
         _patch_whois_iam_response(app, self._iam_response_effective)
@@ -2982,6 +3194,66 @@ class BacnetPypesClient:
             self._csv_agent_site_country_code.presentValue = CharacterString(
                 _truncate_csv_text(cc, 8)
             )
+
+    def update_iss(
+        self,
+        position: IssPositionResult,
+        *,
+        pass_risetime_display: str,
+        pass_duration_sec: float,
+        update_pass_points: bool,
+        use_imperial: bool,
+    ) -> None:
+        """
+        Novelty ISS BACnet points from wheretheiss.at (+ optional Open Notify pass row).
+        When ``use_imperial`` (same SaaS bundle as weather °F): distance and altitude in feet,
+        velocity in mph; else km / km / km/h.
+        On position failure: ISS-Data-OK inactive, overhead inactive, last-update shows error;
+        prior analog present-values are left unchanged. Pass CSV/duration only change when
+        ``update_pass_points`` is True (successful pass fetch).
+        """
+        if self._bi_iss_data_ok is None or self._bi_iss_overhead is None:
+            return
+        if position.ok:
+            if self._ai_iss_distance is not None:
+                self._ai_iss_distance.presentValue = Real(
+                    iss_distance_for_bacnet(position.distance_to_site_km, use_imperial)
+                )
+            if self._ai_iss_latitude is not None:
+                self._ai_iss_latitude.presentValue = Real(float(position.iss_latitude))
+            if self._ai_iss_longitude is not None:
+                self._ai_iss_longitude.presentValue = Real(float(position.iss_longitude))
+            if self._ai_iss_altitude is not None:
+                self._ai_iss_altitude.presentValue = Real(
+                    iss_altitude_for_bacnet(position.iss_altitude_km, use_imperial)
+                )
+            if self._ai_iss_velocity is not None:
+                self._ai_iss_velocity.presentValue = Real(
+                    iss_velocity_for_bacnet(position.iss_velocity_kph, use_imperial)
+                )
+            self._bi_iss_overhead.presentValue = (
+                BinaryPV.active if position.overhead_now else BinaryPV.inactive
+            )
+            self._bi_iss_data_ok.presentValue = BinaryPV.active
+            if self._csv_iss_last_update is not None:
+                lu = position.timestamp_utc or "ok"
+                self._csv_iss_last_update.presentValue = CharacterString(
+                    _truncate_csv_text(lu, 400)
+                )
+        else:
+            self._bi_iss_overhead.presentValue = BinaryPV.inactive
+            self._bi_iss_data_ok.presentValue = BinaryPV.inactive
+            if self._csv_iss_last_update is not None:
+                self._csv_iss_last_update.presentValue = CharacterString(
+                    _truncate_csv_text(position.error or "err", 400)
+                )
+        if update_pass_points:
+            if self._csv_iss_next_pass is not None:
+                self._csv_iss_next_pass.presentValue = CharacterString(
+                    _truncate_csv_text(pass_risetime_display, 256)
+                )
+            if self._ai_iss_pass_duration is not None:
+                self._ai_iss_pass_duration.presentValue = Real(float(pass_duration_sec))
 
     def update_agent_uptime_seconds(self, uptime_seconds: float) -> None:
         """Analog-input Edge-Uptime: present value in seconds."""
@@ -3497,6 +3769,16 @@ class BacnetPypesClient:
         self._bi_agent_weather_display_fahrenheit = None
         self._bi_agent_weather_polling_desired = None
         self._csv_agent_site_country_code = None
+        self._ai_iss_distance = None
+        self._ai_iss_latitude = None
+        self._ai_iss_longitude = None
+        self._ai_iss_altitude = None
+        self._ai_iss_velocity = None
+        self._ai_iss_pass_duration = None
+        self._bi_iss_overhead = None
+        self._bi_iss_data_ok = None
+        self._csv_iss_last_update = None
+        self._csv_iss_next_pass = None
 
     async def restart(self, effective: EffectiveBacnetConfig) -> None:
         await self.stop()
