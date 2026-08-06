@@ -21,6 +21,7 @@ from bacpypes3.apdu import (
     DeleteObjectRequest,
     ErrorRejectAbortNack,
     SimpleAckPDU,
+    WritePropertyRequest,
 )
 from bacpypes3.app import Application
 from bacpypes3.errors import MissingRequiredParameter, ParameterOutOfRange
@@ -44,7 +45,26 @@ from bacpypes3.local.object import Object as LocalObject
 from bacpypes3.object import CharacterStringValueObject as _CharacterStringValueObject
 from bacpypes3.object import MultiStateInputObject as _MultiStateInputObject
 from bacpypes3.pdu import Address, LocalBroadcast
-from bacpypes3.primitivedata import Boolean, CharacterString, Null, ObjectIdentifier, Real, Unsigned
+from bacpypes3.primitivedata import (
+    Boolean,
+    CharacterString,
+    Enumerated,
+    Null,
+    ObjectIdentifier,
+    PropertyIdentifier,
+    Real,
+    Unsigned,
+)
+
+# KMC Conquest (and similar) proprietary property IDs → bacpypes3 atomic type.
+# app.write_property returns "-no property type-" for these; write via direct
+# WritePropertyRequest with TagList encoding (proven on FCU_HOME / BAC-9301ACE).
+_PROPRIETARY_WRITE_TYPES: dict[int, type] = {
+    531: Real,  # multiplier
+    532: Real,  # offset
+    535: Unsigned,  # table-index (AI)
+    647: Enumerated,  # termination (AI/BI)
+}
 
 from edge_agent.json_safe import failure_message, to_json_safe
 from edge_agent.weather_decision_points import compute_outdoor_decisions
@@ -1786,6 +1806,14 @@ def _bacnet_property_identifier(prop: str) -> str:
     return _camel_to_kebab(p)
 
 
+def _proprietary_property_id(prop: str) -> Optional[int]:
+    """Return numeric proprietary property id when prop is digits (e.g. '531')."""
+    p = str(prop).strip()
+    if p.isdigit():
+        return int(p)
+    return None
+
+
 def _json_key_for_bacnet_property(prop_kebab: str) -> str:
     """Stable snake_case key for readback JSON (e.g. present-value -> present_value)."""
     return str(prop_kebab).replace("-", "_")
@@ -2261,6 +2289,29 @@ async def _list_of_initial_values_for_create_object(
         prop_enum = prop_ref.propertyIdentifier
         if prop_ref.propertyArrayIndex is not None and arr_idx is None:
             arr_idx = int(prop_ref.propertyArrayIndex)
+
+        prop_num = _proprietary_property_id(pid)
+        if prop_num is not None and prop_num in _PROPRIETARY_WRITE_TYPES:
+            cls = _PROPRIETARY_WRITE_TYPES[prop_num]
+            try:
+                if cls in (Unsigned, Enumerated):
+                    typed_val = cls(int(val))
+                else:
+                    typed_val = cls(float(val))
+            except (TypeError, ValueError) as e:
+                return None, failure_message(
+                    e, default=f"value coercion failed for proprietary {pid}"
+                )
+            pv = PropertyValue(
+                propertyIdentifier=PropertyIdentifier(prop_num),
+                value=typed_val,
+            )
+            if arr_idx is not None:
+                pv.propertyArrayIndex = Unsigned(arr_idx)
+            if pri is not None:
+                pv.priority = Unsigned(pri)
+            out.append(pv)
+            continue
 
         property_type = object_class.get_property_type(prop_enum)
         if not property_type:
@@ -4302,6 +4353,12 @@ class BacnetPypesClient:
         array_index: Optional[int],
     ) -> Union[Any, ErrorRejectAbortNack]:
         """Single BACnet WriteProperty; priority only for present-value; array_index for arrays."""
+        prop_num = _proprietary_property_id(pid)
+        if prop_num is not None and prop_num in _PROPRIETARY_WRITE_TYPES:
+            return await self._write_proprietary_property(
+                app, addr, ois, prop_num, val, write_timeout
+            )
+
         val = _normalize_write_value_for_bacnet(pid, val, priority, array_index)
         if pid == "present-value":
             if array_index is not None and priority is None:
@@ -4340,6 +4397,35 @@ class BacnetPypesClient:
             app.write_property(addr, ois, pid, val),
             timeout=write_timeout,
         )
+
+    async def _write_proprietary_property(
+        self,
+        app: Application,
+        addr: Address,
+        ois: str,
+        prop_id: int,
+        val: Any,
+        write_timeout: float,
+    ) -> Union[Any, ErrorRejectAbortNack]:
+        """Write known proprietary property IDs with explicit ASN.1 typing."""
+        cls = _PROPRIETARY_WRITE_TYPES[prop_id]
+        if cls in (Unsigned, Enumerated):
+            atomic = cls(int(val))
+        else:
+            atomic = cls(float(val))
+
+        if isinstance(ois, str):
+            objid = ObjectIdentifier(ois)
+        else:
+            objid = ois
+
+        wreq = WritePropertyRequest(
+            objectIdentifier=objid,
+            propertyIdentifier=PropertyIdentifier(prop_id),
+            propertyValue=atomic.encode(),
+            destination=addr,
+        )
+        return await asyncio.wait_for(app.request(wreq), timeout=write_timeout)
 
     async def write_point_multi(
         self,
