@@ -4422,10 +4422,13 @@ class BacnetPypesClient:
         else:
             objid = ois
 
+        # Pass the atomic value (same as Application.write_property). Using
+        # atomic.encode() TagList here yields RejectPDU invalid-tag on KMC
+        # Conquest — proprietary 531/532/535/647 never stick.
         wreq = WritePropertyRequest(
             objectIdentifier=objid,
             propertyIdentifier=PropertyIdentifier(prop_id),
-            propertyValue=atomic.encode(),
+            propertyValue=atomic,
             destination=addr,
         )
         return await asyncio.wait_for(app.request(wreq), timeout=write_timeout)
