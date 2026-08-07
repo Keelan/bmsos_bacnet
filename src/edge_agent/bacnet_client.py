@@ -1752,6 +1752,9 @@ _PLAIN_KIND_TO_OBJECT_ID_TOKEN: dict[str, str] = {
     "trendlog": "trend-log",
     "trendlogmultiple": "trend-log-multiple",
     "eventenrollment": "event-enrollment",
+    "loop": "loop",
+    "file": "file",
+    "program": "program",
 }
 
 
