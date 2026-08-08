@@ -100,6 +100,52 @@ def _priority_value_to_json(obj: Any) -> Any:
     return {"bacnet_choice": choice, "value": to_json_safe(inner)}
 
 
+def _object_identifier_to_json(obj: Any) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, (list, tuple)) and len(obj) == 2:
+        return [str(obj[0]), int(obj[1])]
+    try:
+        # bacpypes3 ObjectIdentifier acts like a 2-tuple
+        if len(obj) == 2:  # type: ignore[arg-type]
+            return [str(obj[0]), int(obj[1])]
+    except Exception:
+        pass
+    return str(obj)
+
+
+def _object_property_reference_to_json(obj: Any) -> Optional[dict[str, Any]]:
+    """Decode BACpypes ObjectPropertyReference for snapshot/import."""
+    oid = getattr(obj, "objectIdentifier", None)
+    if oid is None:
+        return None
+    prop = getattr(obj, "propertyIdentifier", None)
+    arr = getattr(obj, "propertyArrayIndex", None)
+    out: dict[str, Any] = {
+        "objectIdentifier": _object_identifier_to_json(oid),
+        "propertyIdentifier": str(prop) if prop is not None else "present-value",
+    }
+    if arr is not None:
+        try:
+            out["propertyArrayIndex"] = int(arr)
+        except (TypeError, ValueError):
+            out["propertyArrayIndex"] = arr
+    return out
+
+
+def _setpoint_reference_to_json(obj: Any) -> Optional[dict[str, Any]]:
+    """Decode BACpypes SetpointReference CHOICE (nested .setpointReference OPR)."""
+    inner = getattr(obj, "setpointReference", None)
+    if inner is None:
+        # Some stacks put the OPR fields on the outer object
+        if getattr(obj, "objectIdentifier", None) is not None:
+            opr = _object_property_reference_to_json(obj)
+            return {"setpointReference": opr} if opr else None
+        return None
+    opr = _object_property_reference_to_json(inner)
+    return {"setpointReference": opr} if opr else None
+
+
 def to_json_safe(obj: Any) -> Any:
     if obj is None:
         return None
@@ -119,6 +165,44 @@ def to_json_safe(obj: Any) -> Any:
         return _priority_value_to_json(obj)
     if _is_array_of_priority_values(obj):
         return [_priority_value_to_json(x) for x in obj]
+
+    type_name = type(obj).__name__
+    if type_name == "ObjectPropertyReference" or (
+        hasattr(obj, "objectIdentifier")
+        and hasattr(obj, "propertyIdentifier")
+        and not hasattr(obj, "setpointReference")
+        and "Reference" in type_name
+        and "Device" not in type_name
+    ):
+        decoded = _object_property_reference_to_json(obj)
+        if decoded is not None:
+            return decoded
+    if type_name == "SetpointReference" or hasattr(obj, "setpointReference"):
+        decoded_sp = _setpoint_reference_to_json(obj)
+        if decoded_sp is not None:
+            return decoded_sp
+    if type_name == "ObjectIdentifier":
+        return _object_identifier_to_json(obj)
+
+    # BACnet AnyAtomic / constructed Any: attempt common loop-reference casts.
+    cast_out = getattr(obj, "cast_out", None)
+    if callable(cast_out):
+        for cls_name, import_path in (
+            ("ObjectPropertyReference", "bacpypes3.basetypes"),
+            ("SetpointReference", "bacpypes3.basetypes"),
+            ("Real", "bacpypes3.primitivedata"),
+            ("Unsigned", "bacpypes3.primitivedata"),
+            ("Enumerated", "bacpypes3.primitivedata"),
+            ("Boolean", "bacpypes3.primitivedata"),
+            ("CharacterString", "bacpypes3.primitivedata"),
+        ):
+            try:
+                mod = __import__(import_path, fromlist=[cls_name])
+                cls = getattr(mod, cls_name)
+                typed = cast_out(cls)
+                return to_json_safe(typed)
+            except Exception:
+                continue
 
     if isinstance(obj, dict):
         return {str(k): to_json_safe(v) for k, v in obj.items()}
