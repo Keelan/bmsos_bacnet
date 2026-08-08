@@ -20,6 +20,7 @@ from bacpypes3.apdu import (
     CreateObjectRequest,
     DeleteObjectRequest,
     ErrorRejectAbortNack,
+    ReadPropertyRequest,
     SimpleAckPDU,
     WritePropertyRequest,
 )
@@ -1947,7 +1948,24 @@ def _snapshot_property_plan(object_type: Any) -> tuple[list[tuple[str, str]], bo
             row.append(pa)
         return row, True
     if k == "loop":
-        return base + tail_pv, True
+        # Standard loop props used by design import / ControllerLoop; some vendors
+        # reject a subset (e.g. update-interval write-access-denied) — snapshot
+        # still tries a silent read so import can fill what is readable.
+        loop_tail: list[tuple[str, str]] = [
+            ("action", "action"),
+            ("proportional-constant", "proportional_constant"),
+            ("integral-constant", "integral_constant"),
+            ("derivative-constant", "derivative_constant"),
+            ("bias", "bias"),
+            ("minimum-output", "minimum_output"),
+            ("maximum-output", "maximum_output"),
+            ("update-interval", "update_interval"),
+            ("priority-for-writing", "priority_for_writing"),
+            ("controlled-variable-reference", "controlled_variable_reference"),
+            ("setpoint-reference", "setpoint_reference"),
+            ("manipulated-variable-reference", "manipulated_variable_reference"),
+        ]
+        return base + tail_pv + loop_tail, True
     return base + tail_pv, True
 
 
@@ -2020,14 +2038,20 @@ async def _snap_read_property_ex(
     on success (e.g. BACnet null) — caller decides whether to set a JSON key.
     """
     try:
+        prop_num = _proprietary_property_id(str(prop))
+        if prop_num is not None:
+            # bacpypes3 often cannot resolve numeric proprietary PIs by name.
+            prop_arg: Any = PropertyIdentifier(prop_num)
+        else:
+            prop_arg = prop
         if array_index is not None:
             val = await asyncio.wait_for(
-                app.read_property(addr, oid, prop, array_index=array_index),
+                app.read_property(addr, oid, prop_arg, array_index=array_index),
                 timeout=read_timeout,
             )
         else:
             val = await asyncio.wait_for(
-                app.read_property(addr, oid, prop),
+                app.read_property(addr, oid, prop_arg),
                 timeout=read_timeout,
             )
         if isinstance(val, ErrorRejectAbortNack):
@@ -2056,6 +2080,47 @@ async def _snap_read_property_ex(
             )
         return None, False
     except Exception as e:
+        # Fallback: direct ReadProperty for proprietary IDs when helper fails
+        prop_num = _proprietary_property_id(str(prop))
+        if prop_num is not None:
+            try:
+                if isinstance(oid, str):
+                    objid = ObjectIdentifier(oid)
+                else:
+                    objid = oid
+                rreq = ReadPropertyRequest(
+                    objectIdentifier=objid,
+                    propertyIdentifier=PropertyIdentifier(prop_num),
+                    destination=addr,
+                )
+                if array_index is not None:
+                    rreq.propertyArrayIndex = int(array_index)
+                val = await asyncio.wait_for(app.request(rreq), timeout=read_timeout)
+                if isinstance(val, ErrorRejectAbortNack):
+                    if record_error:
+                        errors.append(
+                            {
+                                **err_extra,
+                                "property": prop,
+                                "message": failure_message(
+                                    val, default="read property rejected"
+                                ),
+                            }
+                        )
+                    return None, False
+                # Decode propertyValue when ACK is returned
+                pv = getattr(val, "propertyValue", None)
+                if pv is not None:
+                    try:
+                        val = pv.cast_out(type(pv))  # type: ignore[arg-type]
+                    except Exception:
+                        try:
+                            val = pv.get_value()
+                        except Exception:
+                            val = to_json_safe(pv)
+                return val, True
+            except Exception as e2:
+                e = e2
         if record_error:
             errors.append(
                 {
@@ -2512,6 +2577,51 @@ async def _build_snapshot_style_object_entry(
         if texts:
             state_text = texts
             entry["state_text"] = texts
+
+    # KMC Conquest (and similar) I/O personality — needed for design import
+    # (device-type / termination / multiplier / offset). Silent failures only.
+    k_obj = _object_type_kind_key(ot)
+    if k_obj in ("analoginput", "analogoutput"):
+        for prop, key in (
+            ("device-type", "device_type"),
+            ("531", "531"),
+            ("532", "532"),
+            ("535", "535"),
+            ("647", "647"),
+        ):
+            if prop == "device-type" and k_obj != "analoginput" and k_obj != "analogoutput":
+                continue
+            # AO on some firmware only supports a subset; still try.
+            if prop in ("535", "647") and k_obj == "analogoutput" and prop == "535":
+                pass
+            val = await _snap_read_property(
+                app,
+                addr,
+                oid,
+                prop,
+                read_timeout,
+                errors,
+                err_obj,
+                record_error=False,
+            )
+            if val is not None:
+                entry[key] = to_json_safe(val)
+        # Also keep kebab alias for importers that look up device-type
+        if "device_type" in entry and "device-type" not in entry:
+            entry["device-type"] = entry["device_type"]
+    elif k_obj == "binaryinput":
+        term = await _snap_read_property(
+            app,
+            addr,
+            oid,
+            "647",
+            read_timeout,
+            errors,
+            err_obj,
+            record_error=False,
+        )
+        if term is not None:
+            entry["647"] = to_json_safe(term)
 
     label = _present_value_label(
         entry.get("present_value"),
