@@ -2037,21 +2037,87 @@ async def _snap_read_property_ex(
     Returns (value, success). success is False on NACK/error; value may be None
     on success (e.g. BACnet null) — caller decides whether to set a JSON key.
     """
+    prop_num = _proprietary_property_id(str(prop))
+    if prop_num is not None:
+        # Named PID resolution fails for vendor properties on many builds
+        # ("-no property type-"). Direct Request + typed cast_out matches write path.
+        try:
+            if isinstance(oid, str):
+                objid = ObjectIdentifier(oid)
+            else:
+                objid = oid
+            rreq = ReadPropertyRequest(
+                objectIdentifier=objid,
+                propertyIdentifier=PropertyIdentifier(prop_num),
+                destination=addr,
+            )
+            if array_index is not None:
+                rreq.propertyArrayIndex = int(array_index)
+            val = await asyncio.wait_for(app.request(rreq), timeout=read_timeout)
+            if isinstance(val, ErrorRejectAbortNack):
+                if record_error:
+                    errors.append(
+                        {
+                            **err_extra,
+                            "property": prop,
+                            "message": failure_message(
+                                val, default="read property rejected"
+                            ),
+                        }
+                    )
+                return None, False
+            pv = getattr(val, "propertyValue", None)
+            cls = _PROPRIETARY_WRITE_TYPES.get(prop_num)
+            if pv is not None and cls is not None:
+                try:
+                    val = pv.cast_out(cls)
+                except Exception:
+                    try:
+                        val = pv.get_value()
+                    except Exception:
+                        val = to_json_safe(pv)
+            elif pv is not None:
+                try:
+                    val = pv.get_value()
+                except Exception:
+                    val = to_json_safe(pv)
+            if isinstance(val, str) and "no property type" in val.lower():
+                return None, False
+            return val, True
+        except ErrorRejectAbortNack as err:
+            if record_error:
+                errors.append(
+                    {
+                        **err_extra,
+                        "property": prop,
+                        "message": failure_message(
+                            err, default="read property rejected"
+                        ),
+                    }
+                )
+            return None, False
+        except Exception as e:
+            if record_error:
+                errors.append(
+                    {
+                        **err_extra,
+                        "property": prop,
+                        "message": failure_message(
+                            e, default="read property exception"
+                        ),
+                    }
+                )
+            return None, False
+
     try:
-        prop_num = _proprietary_property_id(str(prop))
-        if prop_num is not None:
-            # bacpypes3 often cannot resolve numeric proprietary PIs by name.
-            prop_arg: Any = PropertyIdentifier(prop_num)
-        else:
-            prop_arg = prop
         if array_index is not None:
             val = await asyncio.wait_for(
-                app.read_property(addr, oid, prop_arg, array_index=array_index),
+                app.read_property(addr, oid, prop, array_index=array_index),
                 timeout=read_timeout,
             )
         else:
             val = await asyncio.wait_for(
-                app.read_property(addr, oid, prop_arg),
+                app.read_property(addr, oid, prop),
                 timeout=read_timeout,
             )
         if isinstance(val, ErrorRejectAbortNack):
@@ -2065,6 +2131,8 @@ async def _snap_read_property_ex(
                         ),
                     }
                 )
+            return None, False
+        if isinstance(val, str) and "no property type" in val.lower():
             return None, False
         return val, True
     except ErrorRejectAbortNack as err:
@@ -2080,47 +2148,6 @@ async def _snap_read_property_ex(
             )
         return None, False
     except Exception as e:
-        # Fallback: direct ReadProperty for proprietary IDs when helper fails
-        prop_num = _proprietary_property_id(str(prop))
-        if prop_num is not None:
-            try:
-                if isinstance(oid, str):
-                    objid = ObjectIdentifier(oid)
-                else:
-                    objid = oid
-                rreq = ReadPropertyRequest(
-                    objectIdentifier=objid,
-                    propertyIdentifier=PropertyIdentifier(prop_num),
-                    destination=addr,
-                )
-                if array_index is not None:
-                    rreq.propertyArrayIndex = int(array_index)
-                val = await asyncio.wait_for(app.request(rreq), timeout=read_timeout)
-                if isinstance(val, ErrorRejectAbortNack):
-                    if record_error:
-                        errors.append(
-                            {
-                                **err_extra,
-                                "property": prop,
-                                "message": failure_message(
-                                    val, default="read property rejected"
-                                ),
-                            }
-                        )
-                    return None, False
-                # Decode propertyValue when ACK is returned
-                pv = getattr(val, "propertyValue", None)
-                if pv is not None:
-                    try:
-                        val = pv.cast_out(type(pv))  # type: ignore[arg-type]
-                    except Exception:
-                        try:
-                            val = pv.get_value()
-                        except Exception:
-                            val = to_json_safe(pv)
-                return val, True
-            except Exception as e2:
-                e = e2
         if record_error:
             errors.append(
                 {
