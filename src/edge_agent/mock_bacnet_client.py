@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Optional
 
 from edge_agent.models import utc_now_iso
@@ -338,6 +339,55 @@ class MockBacnetClient:
             result["readback"] = rb
             result["read_at"] = rb["read_at"]
         return result
+
+    async def atomic_write_file(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: int,
+        file_data: bytes,
+        chunk_size: int,
+        write_timeout: float,
+        include_readback: bool = False,
+        read_chunk_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        if device_instance != 2001:
+            return {
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "object_instance": object_instance,
+                "error": "device not found (I-Am)",
+            }
+        if object_type.lower() != "file":
+            return {
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "object_instance": object_instance,
+                "error": "atomic_write_file object_type must be file",
+            }
+        chunk_size = max(1, int(chunk_size))
+        chunks = 0
+        ack_positions: list[int] = []
+        for pos in range(0, len(file_data), chunk_size):
+            chunks += 1
+            ack_positions.append(pos)
+        digest = hashlib.sha256(file_data).hexdigest()
+        out: dict[str, Any] = {
+            "device_instance": device_instance,
+            "object_type": object_type,
+            "object_instance": object_instance,
+            "file_access": "stream",
+            "bytes_written": len(file_data),
+            "chunk_size": chunk_size,
+            "chunks": chunks,
+            "ack_positions": ack_positions,
+            "expected_sha256": digest,
+        }
+        if include_readback:
+            out["readback_sha256"] = digest
+            out["verified"] = True
+            out["read_chunk_size"] = int(read_chunk_size or 200)
+        return out
 
     async def create_object(
         self,

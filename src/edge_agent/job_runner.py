@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import logging
 import time
 import traceback
@@ -441,6 +443,117 @@ async def run_job(
                             "detail": str(e),
                         },
                     )
+
+        elif job.type == "atomic_write_file":
+            p = job.payload
+            dev = int(p["device_instance"])
+            ot = str(p.get("object_type") or "file")
+            oi = int(p["object_instance"])
+            include_readback = bool(p.get("include_readback", True))
+            chunk_size = int(p.get("chunk_size") or 100)
+            read_chunk_size = int(p.get("read_chunk_size") or 200)
+            expected_len = p.get("byte_length")
+            expected_sha = str(p.get("file_sha256") or "").strip().lower()
+            b64 = p.get("file_b64", p.get("file_data_base64"))
+
+            try:
+                if ot.lower() != "file":
+                    raise ValueError("atomic_write_file object_type must be file")
+                if not isinstance(b64, str) or b64.strip() == "":
+                    raise ValueError("file_b64 is required")
+                file_data = base64.b64decode(b64, validate=True)
+                if len(file_data) > 2 * 1024 * 1024:
+                    raise ValueError("file_b64 exceeds first-cut 2 MiB limit")
+                if expected_len is not None and len(file_data) != int(expected_len):
+                    raise ValueError(
+                        f"byte_length mismatch: payload={int(expected_len)} decoded={len(file_data)}"
+                    )
+                actual_sha = hashlib.sha256(file_data).hexdigest()
+                if expected_sha and actual_sha != expected_sha:
+                    raise ValueError("file_sha256 mismatch")
+
+                chunk_count = max(1, (len(file_data) + max(1, chunk_size) - 1) // max(1, chunk_size))
+                read_count = (
+                    max(1, (len(file_data) + max(1, read_chunk_size) - 1) // max(1, read_chunk_size))
+                    if include_readback
+                    else 0
+                )
+                awf_timeout = max(
+                    settings.request_timeout_seconds * float(chunk_count + read_count) + 10.0,
+                    60.0,
+                )
+                awf = await asyncio.wait_for(
+                    bacnet.atomic_write_file(
+                        dev,
+                        ot,
+                        oi,
+                        file_data,
+                        chunk_size,
+                        settings.request_timeout_seconds,
+                        include_readback=include_readback,
+                        read_chunk_size=read_chunk_size,
+                    ),
+                    timeout=awf_timeout,
+                )
+                data = awf
+                if awf.get("error"):
+                    status = "failed"
+                    summary = failure_message(
+                        awf.get("error"), default="atomic_write_file failed"
+                    )
+                    errors.append(
+                        {
+                            "message": summary,
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                        }
+                    )
+                elif include_readback and awf.get("verified") is not True:
+                    status = "failed"
+                    summary = "AtomicWriteFile readback verification failed"
+                    errors.append(
+                        {
+                            "message": summary,
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                        }
+                    )
+                else:
+                    status = "success"
+                    summary = f"AtomicWriteFile OK ({awf.get('bytes_written', len(file_data))} bytes)"
+                storage.append_write_audit(
+                    job.job_id,
+                    {
+                        "device_instance": dev,
+                        "object_type": ot,
+                        "object_instance": oi,
+                        "byte_length": len(file_data),
+                        "file_sha256": actual_sha,
+                        "outcome": status,
+                        "detail": awf,
+                    },
+                )
+            except (ErrorRejectAbortNack, Exception) as e:
+                status = "failed"
+                summary = "atomic_write_file failed"
+                data = {
+                    "device_instance": dev,
+                    "object_type": ot,
+                    "object_instance": oi,
+                }
+                errors.append({"message": str(e), "traceback": traceback.format_exc()})
+                storage.append_write_audit(
+                    job.job_id,
+                    {
+                        "device_instance": dev,
+                        "object_type": ot,
+                        "object_instance": oi,
+                        "outcome": "failed",
+                        "detail": str(e),
+                    },
+                )
 
         elif job.type == "create_object":
             p = job.payload

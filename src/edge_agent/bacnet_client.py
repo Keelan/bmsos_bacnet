@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -16,6 +17,10 @@ from typing import Any, Optional, Union
 from bacpypes3.apdu import (
     AbortPDU,
     AbortReason,
+    AtomicReadFileACK,
+    AtomicReadFileRequest,
+    AtomicWriteFileACK,
+    AtomicWriteFileRequest,
     CreateObjectACK,
     CreateObjectRequest,
     DeleteObjectRequest,
@@ -28,6 +33,11 @@ from bacpypes3.app import Application
 from bacpypes3.errors import MissingRequiredParameter, ParameterOutOfRange
 from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.basetypes import (
+    AtomicReadFileACKAccessMethodStreamAccess,
+    AtomicReadFileRequestAccessMethodChoice,
+    AtomicReadFileRequestAccessMethodChoiceStreamAccess,
+    AtomicWriteFileRequestAccessMethodChoice,
+    AtomicWriteFileRequestAccessMethodChoiceStreamAccess,
     BinaryPV,
     CreateObjectRequestObjectSpecifier,
     EngineeringUnits,
@@ -4988,6 +4998,261 @@ class BacnetPypesClient:
                 "priority": priority,
                 "error": failure_message(e, default="write raised exception"),
             }
+
+    async def atomic_read_file(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: int,
+        read_timeout: float,
+        chunk_size: int = 200,
+        expected_length: Optional[int] = None,
+    ) -> dict[str, Any]:
+        addr, addr_err = await self._resolve_device_address(device_instance)
+        if addr_err:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": failure_message(addr_err, default="device address resolution failed"),
+            }
+        app = self._require_app()
+        vendor_info = await app.get_vendor_info(device_address=addr)
+        try:
+            oid = await app.parse_object_identifier(
+                _object_id_string(object_type, object_instance),
+                vendor_info=vendor_info,
+            )
+        except (TypeError, ValueError) as e:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": failure_message(e, default="invalid file object identifier"),
+            }
+
+        chunk_size = max(1, min(int(chunk_size), 2048))
+        pos = 0
+        chunks = 0
+        data = bytearray()
+        eof = False
+        try:
+            while not eof:
+                req = AtomicReadFileRequest(
+                    fileIdentifier=oid,
+                    accessMethod=AtomicReadFileRequestAccessMethodChoice(
+                        streamAccess=AtomicReadFileRequestAccessMethodChoiceStreamAccess(
+                            fileStartPosition=pos,
+                            requestedOctetCount=chunk_size,
+                        )
+                    ),
+                    destination=addr,
+                )
+                response = await asyncio.wait_for(app.request(req), timeout=read_timeout)
+                if isinstance(response, ErrorRejectAbortNack):
+                    return {
+                        "device_instance": device_instance,
+                        "object_type": _object_type_for_json(object_type),
+                        "object_instance": object_instance,
+                        "error": failure_message(response, default="AtomicReadFile rejected"),
+                        "bytes_read": len(data),
+                    }
+                if not isinstance(response, AtomicReadFileACK):
+                    return {
+                        "device_instance": device_instance,
+                        "object_type": _object_type_for_json(object_type),
+                        "object_instance": object_instance,
+                        "error": "unexpected response to AtomicReadFile",
+                        "bytes_read": len(data),
+                    }
+                stream = response.accessMethod.streamAccess
+                if stream is None or not isinstance(stream, AtomicReadFileACKAccessMethodStreamAccess):
+                    return {
+                        "device_instance": device_instance,
+                        "object_type": _object_type_for_json(object_type),
+                        "object_instance": object_instance,
+                        "error": "AtomicReadFile response was not stream access",
+                        "bytes_read": len(data),
+                    }
+                file_chunk = bytes(stream.fileData)
+                data.extend(file_chunk)
+                chunks += 1
+                pos = int(stream.fileStartPosition) + len(file_chunk)
+                eof = bool(response.endOfFile)
+                if expected_length is not None and len(data) >= int(expected_length):
+                    break
+                if len(file_chunk) == 0:
+                    break
+        except ErrorRejectAbortNack as err:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": failure_message(err, default="AtomicReadFile rejected"),
+                "bytes_read": len(data),
+            }
+        except Exception as e:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": failure_message(e, default="AtomicReadFile failed"),
+                "bytes_read": len(data),
+            }
+
+        raw = bytes(data)
+        return {
+            "device_instance": device_instance,
+            "object_type": _object_type_for_json(object_type),
+            "object_instance": object_instance,
+            "file_access": "stream",
+            "bytes_read": len(raw),
+            "chunks": chunks,
+            "chunk_size": chunk_size,
+            "end_of_file": eof,
+            "file_sha256": hashlib.sha256(raw).hexdigest(),
+            "file_data": raw,
+        }
+
+    async def atomic_write_file(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: int,
+        file_data: bytes,
+        chunk_size: int,
+        write_timeout: float,
+        include_readback: bool = False,
+        read_chunk_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        addr, addr_err = await self._resolve_device_address(device_instance)
+        if addr_err:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": failure_message(addr_err, default="device address resolution failed"),
+            }
+        app = self._require_app()
+        vendor_info = await app.get_vendor_info(device_address=addr)
+        try:
+            oid = await app.parse_object_identifier(
+                _object_id_string(object_type, object_instance),
+                vendor_info=vendor_info,
+            )
+        except (TypeError, ValueError) as e:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "error": failure_message(e, default="invalid file object identifier"),
+            }
+
+        chunk_size = max(1, min(int(chunk_size), 2048))
+        expected_sha = hashlib.sha256(file_data).hexdigest()
+        ack_positions: list[int] = []
+        chunks = 0
+        pos = 0
+        try:
+            while pos < len(file_data):
+                chunk = file_data[pos : pos + chunk_size]
+                req = AtomicWriteFileRequest(
+                    fileIdentifier=oid,
+                    accessMethod=AtomicWriteFileRequestAccessMethodChoice(
+                        streamAccess=AtomicWriteFileRequestAccessMethodChoiceStreamAccess(
+                            fileStartPosition=pos,
+                            fileData=chunk,
+                        )
+                    ),
+                    destination=addr,
+                )
+                response = await asyncio.wait_for(app.request(req), timeout=write_timeout)
+                if isinstance(response, ErrorRejectAbortNack):
+                    return {
+                        "device_instance": device_instance,
+                        "object_type": _object_type_for_json(object_type),
+                        "object_instance": object_instance,
+                        "file_access": "stream",
+                        "bytes_written": pos,
+                        "chunk_size": chunk_size,
+                        "chunks": chunks,
+                        "ack_positions": ack_positions,
+                        "expected_sha256": expected_sha,
+                        "error": failure_message(response, default="AtomicWriteFile rejected"),
+                    }
+                if not isinstance(response, AtomicWriteFileACK):
+                    return {
+                        "device_instance": device_instance,
+                        "object_type": _object_type_for_json(object_type),
+                        "object_instance": object_instance,
+                        "file_access": "stream",
+                        "bytes_written": pos,
+                        "chunk_size": chunk_size,
+                        "chunks": chunks,
+                        "ack_positions": ack_positions,
+                        "expected_sha256": expected_sha,
+                        "error": "unexpected response to AtomicWriteFile",
+                    }
+                ack_positions.append(int(response.fileStartPosition))
+                chunks += 1
+                pos += len(chunk)
+        except ErrorRejectAbortNack as err:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "file_access": "stream",
+                "bytes_written": pos,
+                "chunk_size": chunk_size,
+                "chunks": chunks,
+                "ack_positions": ack_positions,
+                "expected_sha256": expected_sha,
+                "error": failure_message(err, default="AtomicWriteFile rejected"),
+            }
+        except Exception as e:
+            return {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "object_instance": object_instance,
+                "file_access": "stream",
+                "bytes_written": pos,
+                "chunk_size": chunk_size,
+                "chunks": chunks,
+                "ack_positions": ack_positions,
+                "expected_sha256": expected_sha,
+                "error": failure_message(e, default="AtomicWriteFile failed"),
+            }
+
+        out: dict[str, Any] = {
+            "device_instance": device_instance,
+            "object_type": _object_type_for_json(object_type),
+            "object_instance": object_instance,
+            "file_access": "stream",
+            "bytes_written": len(file_data),
+            "chunk_size": chunk_size,
+            "chunks": chunks,
+            "ack_positions": ack_positions,
+            "expected_sha256": expected_sha,
+        }
+        if include_readback:
+            rb = await self.atomic_read_file(
+                device_instance,
+                object_type,
+                object_instance,
+                write_timeout,
+                chunk_size=int(read_chunk_size or 200),
+                expected_length=len(file_data),
+            )
+            rb_data = rb.pop("file_data", b"")
+            rb_sha = rb.get("file_sha256")
+            out["readback_sha256"] = rb_sha
+            out["readback_bytes"] = rb.get("bytes_read")
+            out["readback_chunks"] = rb.get("chunks")
+            out["read_chunk_size"] = rb.get("chunk_size")
+            out["verified"] = rb_sha == expected_sha and len(rb_data) == len(file_data) and rb_data == file_data
+            if rb.get("error"):
+                out["readback_error"] = rb.get("error")
+        return out
 
     async def create_object(
         self,
