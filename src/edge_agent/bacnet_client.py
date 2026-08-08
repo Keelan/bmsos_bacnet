@@ -2607,6 +2607,18 @@ async def _build_snapshot_style_object_entry(
         if it is not None:
             inactive_text = str(it)
             entry["inactive_text"] = inactive_text
+        pol = await _snap_read_property(
+            app,
+            addr,
+            oid,
+            "polarity",
+            read_timeout,
+            errors,
+            err_obj,
+            record_error=False,
+        )
+        if pol is not None:
+            entry["polarity"] = to_json_safe(pol)
     elif _is_multistate_object_type(ot):
         n_states, texts = await _read_multistate_state_text(
             app, addr, oid, read_timeout, errors, err_obj
