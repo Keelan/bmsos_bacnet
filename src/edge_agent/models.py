@@ -362,6 +362,17 @@ class BacnetClient(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    async def atomic_read_file(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: int,
+        read_timeout: float,
+        chunk_size: int = 200,
+        expected_length: Optional[int] = None,
+    ) -> dict[str, Any]:
+        ...
+
     async def atomic_write_file(
         self,
         device_instance: int,

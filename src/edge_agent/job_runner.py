@@ -444,6 +444,95 @@ async def run_job(
                         },
                     )
 
+        elif job.type == "atomic_read_file":
+            p = job.payload
+            dev = int(p["device_instance"])
+            ot = str(p.get("object_type") or "file")
+            oi = int(p["object_instance"])
+            chunk_size = int(p.get("read_chunk_size") or p.get("chunk_size") or 200)
+            expected_len = p.get("byte_length")
+            max_len = int(p.get("max_byte_length") or (2 * 1024 * 1024))
+
+            try:
+                if ot.lower() != "file":
+                    raise ValueError("atomic_read_file object_type must be file")
+                if max_len < 1 or max_len > 2 * 1024 * 1024:
+                    raise ValueError("max_byte_length must be between 1 and 2097152")
+
+                read_timeout = max(settings.request_timeout_seconds, 60.0)
+                arf = await asyncio.wait_for(
+                    bacnet.atomic_read_file(
+                        dev,
+                        ot,
+                        oi,
+                        settings.request_timeout_seconds,
+                        chunk_size=chunk_size,
+                        expected_length=int(expected_len) if expected_len is not None else None,
+                    ),
+                    timeout=read_timeout,
+                )
+                raw = arf.pop("file_data", b"")
+                if isinstance(raw, bytearray):
+                    raw = bytes(raw)
+                if not isinstance(raw, bytes):
+                    raise ValueError("AtomicReadFile returned non-bytes file_data")
+                if len(raw) > max_len:
+                    raise ValueError("AtomicReadFile result exceeds max_byte_length")
+
+                data = {
+                    **arf,
+                    "file_b64": base64.b64encode(raw).decode("ascii"),
+                    "byte_length": len(raw),
+                    "file_sha256": hashlib.sha256(raw).hexdigest(),
+                }
+                if arf.get("error"):
+                    status = "failed"
+                    summary = failure_message(
+                        arf.get("error"), default="atomic_read_file failed"
+                    )
+                    errors.append(
+                        {
+                            "message": summary,
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                        }
+                    )
+                else:
+                    status = "success"
+                    summary = f"AtomicReadFile OK ({len(raw)} bytes)"
+                storage.append_write_audit(
+                    job.job_id,
+                    {
+                        "device_instance": dev,
+                        "object_type": ot,
+                        "object_instance": oi,
+                        "byte_length": len(raw),
+                        "file_sha256": data["file_sha256"],
+                        "outcome": status,
+                        "detail": {k: v for k, v in data.items() if k != "file_b64"},
+                    },
+                )
+            except (ErrorRejectAbortNack, Exception) as e:
+                status = "failed"
+                summary = "atomic_read_file failed"
+                data = {
+                    "device_instance": dev,
+                    "object_type": ot,
+                    "object_instance": oi,
+                }
+                errors.append({"message": str(e), "traceback": traceback.format_exc()})
+                storage.append_write_audit(
+                    job.job_id,
+                    {
+                        "device_instance": dev,
+                        "object_type": ot,
+                        "object_instance": oi,
+                        "outcome": "failed",
+                        "detail": str(e),
+                    },
+                )
+
         elif job.type == "atomic_write_file":
             p = job.payload
             dev = int(p["device_instance"])

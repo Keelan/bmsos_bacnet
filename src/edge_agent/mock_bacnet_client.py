@@ -389,6 +389,45 @@ class MockBacnetClient:
             out["read_chunk_size"] = int(read_chunk_size or 200)
         return out
 
+    async def atomic_read_file(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: int,
+        read_timeout: float,
+        chunk_size: int = 200,
+        expected_length: Optional[int] = None,
+    ) -> dict[str, Any]:
+        if device_instance != 2001:
+            return {
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "object_instance": object_instance,
+                "error": "device not found (I-Am)",
+            }
+        if object_type.lower() != "file":
+            return {
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "object_instance": object_instance,
+                "error": "atomic_read_file object_type must be file",
+            }
+        data = b"\x00\x81\x00\x06\x00\x00\x00\x16\xff\xff\x00\x00REM mock\r\n"
+        if expected_length is not None:
+            data = data[: int(expected_length)]
+        return {
+            "device_instance": device_instance,
+            "object_type": object_type,
+            "object_instance": object_instance,
+            "file_access": "stream",
+            "bytes_read": len(data),
+            "chunks": 1,
+            "chunk_size": int(chunk_size),
+            "end_of_file": True,
+            "file_sha256": hashlib.sha256(data).hexdigest(),
+            "file_data": data,
+        }
+
     async def create_object(
         self,
         device_instance: int,
