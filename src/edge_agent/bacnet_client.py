@@ -1818,6 +1818,18 @@ def _proprietary_property_id(prop: str) -> Optional[int]:
     return None
 
 
+def _proprietary_values_match(prop_id: int, expected: Any, actual: Any) -> bool:
+    """Compare proprietary write intent vs re-read (Real uses float tolerance)."""
+    if actual is None:
+        return False
+    try:
+        if prop_id in (531, 532):
+            return abs(float(actual) - float(expected)) < 0.05
+        return int(actual) == int(expected)
+    except (TypeError, ValueError):
+        return False
+
+
 def _json_key_for_bacnet_property(prop_kebab: str) -> str:
     """Stable snake_case key for readback JSON (e.g. present-value -> present_value)."""
     return str(prop_kebab).replace("-", "_")
@@ -4546,29 +4558,64 @@ class BacnetPypesClient:
         prop_id: int,
         val: Any,
         write_timeout: float,
-    ) -> Union[Any, ErrorRejectAbortNack]:
-        """Write known proprietary property IDs with explicit ASN.1 typing."""
+        *,
+        verify: bool = True,
+        retries: int = 2,
+    ) -> Union[Any, ErrorRejectAbortNack, str]:
+        """Write known proprietary property IDs with explicit ASN.1 typing.
+
+        KMC Conquest returns SimpleACK for TagList `propertyValue` but never
+        applies the value (invalid-tag when TagList encodes incompletely). Pass
+        the atomic primitive so bacpypes3 wraps it as Any. After ACK, re-read
+        via the proprietary ReadProperty path and fail when the value did not
+        stick so SaaS never records false Write OK for I/O personality.
+        """
         cls = _PROPRIETARY_WRITE_TYPES[prop_id]
         if cls in (Unsigned, Enumerated):
-            atomic = cls(int(val))
+            expected_num: Union[int, float] = int(val)
+            atomic = cls(expected_num)
         else:
-            atomic = cls(float(val))
+            expected_num = float(val)
+            atomic = cls(expected_num)
 
         if isinstance(ois, str):
             objid = ObjectIdentifier(ois)
         else:
             objid = ois
 
-        # Pass the atomic value (same as Application.write_property). Using
-        # atomic.encode() TagList here yields RejectPDU invalid-tag on KMC
-        # Conquest — proprietary 531/532/535/647 never stick.
-        wreq = WritePropertyRequest(
-            objectIdentifier=objid,
-            propertyIdentifier=PropertyIdentifier(prop_id),
-            propertyValue=atomic,
-            destination=addr,
+        last_resp: Union[Any, ErrorRejectAbortNack, None] = None
+        last_actual: Any = None
+        for attempt in range(max(1, int(retries))):
+            wreq = WritePropertyRequest(
+                objectIdentifier=objid,
+                propertyIdentifier=PropertyIdentifier(prop_id),
+                propertyValue=atomic,
+                destination=addr,
+            )
+            last_resp = await asyncio.wait_for(app.request(wreq), timeout=write_timeout)
+            if isinstance(last_resp, ErrorRejectAbortNack):
+                return last_resp
+            if not verify:
+                return last_resp
+            # Brief settle; some Conquest points apply I/O props a tick late.
+            await asyncio.sleep(0.08 * (attempt + 1))
+            actual, ok = await _snap_read_property_ex(
+                app,
+                addr,
+                objid,
+                str(prop_id),
+                write_timeout,
+                [],
+                {},
+                record_error=False,
+            )
+            last_actual = actual
+            if ok and _proprietary_values_match(prop_id, expected_num, actual):
+                return last_resp
+        return (
+            f"proprietary {prop_id} write did not stick "
+            f"(want {expected_num!r}, read {last_actual!r})"
         )
-        return await asyncio.wait_for(app.request(wreq), timeout=write_timeout)
 
     async def write_point_multi(
         self,
@@ -4723,6 +4770,17 @@ class BacnetPypesClient:
                             ),
                         }
                     )
+                elif isinstance(resp, str) and resp.strip():
+                    # Proprietary write-verify failure (not a BACnet NACK string alone).
+                    write_results.append(
+                        {
+                            "index": i,
+                            "property": str(prop_raw),
+                            "bacnet_property": pid,
+                            "ok": False,
+                            "error": resp.strip(),
+                        }
+                    )
                 else:
                     write_results.append(
                         {
@@ -4801,14 +4859,27 @@ class BacnetPypesClient:
                         if pe:
                             rb_obj[f"{jkey}_errors"] = pe
                     else:
-                        pv = await asyncio.wait_for(
-                            app.read_property(addr, ois, rpid),
-                            timeout=write_timeout,
+                        # Vendor proprietary numerics need the typed ReadProperty path.
+                        pe2: list[dict[str, Any]] = []
+                        pv, ok_rb = await _snap_read_property_ex(
+                            app,
+                            addr,
+                            ois,
+                            rpid,
+                            write_timeout,
+                            pe2,
+                            {
+                                "device_instance": device_instance,
+                                "object_type": object_type,
+                                "object_instance": object_instance,
+                            },
+                            record_error=True,
                         )
-                        if isinstance(pv, ErrorRejectAbortNack):
+                        if not ok_rb:
                             rb_obj[jkey] = None
+                            msg = pe2[-1].get("message") if pe2 else "readback failed"
                             rb_obj[f"{jkey}_error"] = failure_message(
-                                pv, default="readback rejected"
+                                msg, default="readback failed"
                             )
                         else:
                             rb_obj[jkey] = to_json_safe(pv)
