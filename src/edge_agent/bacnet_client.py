@@ -1930,10 +1930,18 @@ def _snapshot_property_plan(object_type: Any) -> tuple[list[tuple[str, str]], bo
             "notificationclass",
             "eventenrollment",
             "program",
-            "trendlog",
-            "trendlogmultiple",
         }
     )
+    if k in {"trendlog", "trendlogmultiple"}:
+        return base + [
+            ("log-device-object-property", "log_device_object_property"),
+            ("logging-type", "logging_type"),
+            ("logging-interval", "logging_interval"),
+            ("buffer-size", "buffer_size"),
+            ("max-record-count", "max_record_count"),
+            ("stop-when-full", "stop_when_full"),
+            ("enable", "enable"),
+        ], False
     if k in meta_only:
         return base, False
     if k == "schedule":
