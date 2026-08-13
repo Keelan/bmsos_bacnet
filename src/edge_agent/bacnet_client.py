@@ -5362,7 +5362,9 @@ class BacnetPypesClient:
             probe = await asyncio.wait_for(
                 app.read_property(addr, oid, "object-name"), timeout=write_timeout
             )
-            missing = isinstance(probe, ErrorRejectAbortNack)
+            missing = isinstance(probe, ErrorRejectAbortNack) or (
+                isinstance(probe, str) and "unknown-object" in probe.lower()
+            )
         except ErrorRejectAbortNack:
             missing = True
         except Exception as exc:
