@@ -5355,35 +5355,20 @@ class BacnetPypesClient:
         except (TypeError, ValueError) as exc:
             return {**base, "error": failure_message(exc, default="invalid schedule object")}
 
-        # Schedule objects can be deleted on panels. Recreate the slot before
-        # writing its properties so a normal design deploy can restore it.
-        created = False
-        try:
-            probe = await asyncio.wait_for(
-                app.read_property(addr, oid, "object-name"), timeout=write_timeout
-            )
-            missing = isinstance(probe, ErrorRejectAbortNack) or (
-                isinstance(probe, str) and "unknown-object" in probe.lower()
-            )
-        except ErrorRejectAbortNack:
-            missing = True
-        except Exception as exc:
-            return {**base, "error": failure_message(exc, default="schedule probe failed")}
-
-        if missing:
-            create_result = await self.create_object(
-                device_instance,
-                "schedule",
-                object_instance,
-                [
-                    {"property": "object-name", "value": str(schedule.get("object_name") or f"SCH_{object_instance:02d}")},
-                    {"property": "description", "value": str(schedule.get("description") or "")},
-                ],
-                write_timeout,
-            )
-            if create_result.get("error"):
-                return {**base, "create_result": create_result, "error": create_result["error"]}
-            created = True
+        # Schedule objects can be deleted on panels. Attempt CreateObject on
+        # every deploy, as with KMC loops; an existing slot rejects the create
+        # and can still receive the verified property writes below.
+        create_result = await self.create_object(
+            device_instance,
+            "schedule",
+            object_instance,
+            [
+                {"property": "object-name", "value": str(schedule.get("object_name") or f"SCH_{object_instance:02d}")},
+                {"property": "description", "value": str(schedule.get("description") or "")},
+            ],
+            write_timeout,
+        )
+        created = not bool(create_result.get("error"))
 
         expected: dict[str, Any] = {
             "object_name": str(values["object-name"]),
@@ -5464,7 +5449,7 @@ class BacnetPypesClient:
         if not await write_one("out-of-service", values["out-of-service"]):
             return {**base, "write_results": writes, "error": writes[-1]["error"]}
 
-        out: dict[str, Any] = {**base, "created": created, "write_results": writes}
+        out: dict[str, Any] = {**base, "created": created, "create_result": create_result, "write_results": writes}
         if include_readback:
             errors: list[dict[str, Any]] = []
             readback = await _build_snapshot_style_object_entry(
