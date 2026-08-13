@@ -1941,7 +1941,9 @@ def _snapshot_property_plan(object_type: Any) -> tuple[list[tuple[str, str]], bo
         return base + [
             ("log-device-object-property", "log_device_object_property"),
             ("logging-type", "logging_type"),
-            ("logging-interval", "logging_interval"),
+            # Use the numeric BACnet identifier explicitly; KMC/YABE expose
+            # Log_Interval as property 134.
+            ("134", "logging_interval"),
             ("buffer-size", "buffer_size"),
             ("max-record-count", "max_record_count"),
             ("stop-when-full", "stop_when_full"),
