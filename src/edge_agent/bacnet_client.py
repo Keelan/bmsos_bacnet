@@ -78,6 +78,13 @@ _PROPRIETARY_WRITE_TYPES: dict[int, type] = {
 }
 
 from edge_agent.json_safe import failure_message, to_json_safe
+from edge_agent.bacnet_schedule import (
+    WEEKDAYS,
+    calendar_property_to_json,
+    calendar_write_values,
+    schedule_property_to_json,
+    schedule_write_values,
+)
 from edge_agent.weather_decision_points import compute_outdoor_decisions
 from edge_agent.weather_derived import (
     dew_point_celsius,
@@ -1930,8 +1937,18 @@ def _snapshot_property_plan(object_type: Any) -> tuple[list[tuple[str, str]], bo
     if k in meta_only:
         return base, False
     if k == "schedule":
-        # present-value is often a constructed schedule; skip bulk read (avoids repr leaks).
-        return base, False
+        return base + [
+            ("present-value", "present_value"),
+            ("effective-period", "effective_period"),
+            ("weekly-schedule", "weekly_schedule"),
+            ("exception-schedule", "exception_schedule"),
+            ("schedule-default", "schedule_default"),
+            ("list-of-object-property-references", "references"),
+            ("priority-for-writing", "priority_for_writing"),
+            ("status-flags", "status_flags"),
+            ("reliability", "reliability"),
+            ("out-of-service", "out_of_service"),
+        ], False
     tail_pv = [
         ("present-value", "present_value"),
         ("status-flags", "status_flags"),
@@ -1942,7 +1959,10 @@ def _snapshot_property_plan(object_type: Any) -> tuple[list[tuple[str, str]], bo
     rd: tuple[str, str] = ("relinquish-default", "relinquish_default")
     pa: tuple[str, str] = ("priority-array", "priority_array")
     if k == "calendar":
-        return base + [("present-value", "present_value")], False
+        return base + [
+            ("present-value", "present_value"),
+            ("date-list", "date_list"),
+        ], False
     if k in ("analoginput", "analogoutput"):
         ao = base + [("units", "units")] + tail_pv + [rel]
         if k == "analogoutput":
@@ -2566,6 +2586,7 @@ async def _build_snapshot_style_object_entry(
         "object_instance": oi,
     }
     plan, try_optional_reliability = _snapshot_property_plan(ot)
+    object_kind = _object_type_kind_key(ot)
     for prop, key in plan:
         if present_value_precooked is not None and key == "present_value":
             entry[key] = present_value_precooked
@@ -2586,7 +2607,21 @@ async def _build_snapshot_style_object_entry(
             app, addr, oid, prop, read_timeout, errors, err_obj
         )
         if val is not None:
-            entry[key] = val
+            try:
+                if object_kind == "schedule":
+                    entry[key] = schedule_property_to_json(prop, val)
+                elif object_kind == "calendar":
+                    entry[key] = calendar_property_to_json(prop, val)
+                else:
+                    entry[key] = val
+            except (TypeError, ValueError) as exc:
+                errors.append(
+                    {
+                        **err_obj,
+                        "property": prop,
+                        "message": f"could not decode BACnet {object_kind} property: {exc}",
+                    }
+                )
     if try_optional_reliability and "reliability" not in entry:
         r = await _snap_read_property(
             app,
@@ -5252,6 +5287,302 @@ class BacnetPypesClient:
             out["verified"] = rb_sha == expected_sha and len(rb_data) == len(file_data) and rb_data == file_data
             if rb.get("error"):
                 out["readback_error"] = rb.get("error")
+        return out
+
+    async def _write_structured_property(
+        self,
+        app: Application,
+        addr: Address,
+        oid: Any,
+        property_name: str,
+        value: Any,
+        write_timeout: float,
+        *,
+        array_index: Optional[int] = None,
+    ) -> Optional[str]:
+        try:
+            response = await asyncio.wait_for(
+                app.write_property(
+                    addr,
+                    oid,
+                    property_name,
+                    value,
+                    array_index=array_index,
+                ),
+                timeout=write_timeout,
+            )
+            if isinstance(response, ErrorRejectAbortNack):
+                return failure_message(response, default=f"{property_name} write rejected")
+            if isinstance(response, str) and response.startswith("-no "):
+                return response.strip("-")
+            return None
+        except ErrorRejectAbortNack as err:
+            return failure_message(err, default=f"{property_name} write rejected")
+        except Exception as exc:
+            return failure_message(exc, default=f"{property_name} write failed")
+
+    async def write_schedule(
+        self,
+        device_instance: int,
+        object_instance: int,
+        schedule: dict[str, Any],
+        write_timeout: float,
+        include_readback: bool = True,
+    ) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "device_instance": device_instance,
+            "object_type": "schedule",
+            "object_instance": object_instance,
+        }
+        try:
+            values = schedule_write_values(schedule)
+        except (TypeError, ValueError) as exc:
+            return {**base, "error": str(exc)}
+
+        addr, addr_err = await self._resolve_device_address(device_instance)
+        if addr_err:
+            return {
+                **base,
+                "error": failure_message(addr_err, default="device address resolution failed"),
+            }
+        app = self._require_app()
+        vendor_info = await app.get_vendor_info(device_address=addr)
+        try:
+            oid = await app.parse_object_identifier(
+                _object_id_string("schedule", object_instance),
+                vendor_info=vendor_info,
+            )
+        except (TypeError, ValueError) as exc:
+            return {**base, "error": failure_message(exc, default="invalid schedule object")}
+
+        expected: dict[str, Any] = {
+            "object_name": str(values["object-name"]),
+            "description": str(values["description"]),
+            "effective_period": schedule_property_to_json(
+                "effective-period", values["effective-period"]
+            ),
+            "weekly_schedule": schedule_property_to_json(
+                "weekly-schedule", values["weekly-schedule"]
+            ),
+            "exception_schedule": schedule_property_to_json(
+                "exception-schedule", values["exception-schedule"]
+            ),
+            "schedule_default": schedule_property_to_json(
+                "schedule-default", values["schedule-default"]
+            ),
+            "references": schedule_property_to_json(
+                "list-of-object-property-references",
+                values["list-of-object-property-references"],
+            ),
+            "priority_for_writing": int(values["priority-for-writing"]),
+            "out_of_service": bool(values["out-of-service"]),
+        }
+        writes: list[dict[str, Any]] = []
+
+        async def write_one(
+            property_name: str, value: Any, *, array_index: Optional[int] = None
+        ) -> bool:
+            error = await self._write_structured_property(
+                app,
+                addr,
+                oid,
+                property_name,
+                value,
+                write_timeout,
+                array_index=array_index,
+            )
+            row: dict[str, Any] = {"property": property_name, "ok": error is None}
+            if array_index is not None:
+                row["array_index"] = array_index
+            if error is not None:
+                row["error"] = error
+            writes.append(row)
+            return error is None
+
+        # Keep targets relinquished while a multi-property schedule update is partial.
+        if not await write_one("out-of-service", Boolean(True)):
+            return {**base, "write_results": writes, "error": writes[-1]["error"]}
+        for property_name in ("object-name", "description", "effective-period"):
+            if not await write_one(property_name, values[property_name]):
+                return {**base, "write_results": writes, "error": writes[-1]["error"]}
+
+        weekly = values["weekly-schedule"]
+        for index, _weekday in enumerate(WEEKDAYS, start=1):
+            if not await write_one(
+                "weekly-schedule", weekly[index - 1], array_index=index
+            ):
+                return {**base, "write_results": writes, "error": writes[-1]["error"]}
+
+        exceptions = values["exception-schedule"]
+        if not await write_one(
+            "exception-schedule", Unsigned(len(exceptions)), array_index=0
+        ):
+            return {**base, "write_results": writes, "error": writes[-1]["error"]}
+        for index, event in enumerate(exceptions, start=1):
+            if not await write_one(
+                "exception-schedule", event, array_index=index
+            ):
+                return {**base, "write_results": writes, "error": writes[-1]["error"]}
+
+        for property_name in (
+            "schedule-default",
+            "list-of-object-property-references",
+            "priority-for-writing",
+        ):
+            if not await write_one(property_name, values[property_name]):
+                return {**base, "write_results": writes, "error": writes[-1]["error"]}
+        if not await write_one("out-of-service", values["out-of-service"]):
+            return {**base, "write_results": writes, "error": writes[-1]["error"]}
+
+        out: dict[str, Any] = {**base, "write_results": writes}
+        if include_readback:
+            errors: list[dict[str, Any]] = []
+            readback = await _build_snapshot_style_object_entry(
+                app,
+                addr,
+                device_instance,
+                "schedule",
+                object_instance,
+                write_timeout,
+                errors,
+                read_oid=oid,
+            )
+            compared = {key: readback.get(key) for key in expected}
+            differences = {
+                key: {"expected": expected[key], "actual": compared.get(key)}
+                for key in expected
+                if compared.get(key) != expected[key]
+            }
+            out.update(
+                {
+                    "expected": expected,
+                    "readback": readback,
+                    "verified": not differences and not errors,
+                    "differences": differences,
+                }
+            )
+            if errors:
+                out["readback_errors"] = errors
+        return out
+
+    async def write_calendar(
+        self,
+        device_instance: int,
+        object_instance: int,
+        calendar: dict[str, Any],
+        write_timeout: float,
+        include_readback: bool = True,
+        create_if_missing: bool = True,
+    ) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "device_instance": device_instance,
+            "object_type": "calendar",
+            "object_instance": object_instance,
+        }
+        try:
+            values = calendar_write_values(calendar)
+        except (TypeError, ValueError) as exc:
+            return {**base, "error": str(exc)}
+
+        addr, addr_err = await self._resolve_device_address(device_instance)
+        if addr_err:
+            return {
+                **base,
+                "error": failure_message(addr_err, default="device address resolution failed"),
+            }
+        app = self._require_app()
+        vendor_info = await app.get_vendor_info(device_address=addr)
+        try:
+            oid = await app.parse_object_identifier(
+                _object_id_string("calendar", object_instance),
+                vendor_info=vendor_info,
+            )
+        except (TypeError, ValueError) as exc:
+            return {**base, "error": failure_message(exc, default="invalid calendar object")}
+
+        created = False
+        try:
+            probe = await asyncio.wait_for(
+                app.read_property(addr, oid, "object-name"), timeout=write_timeout
+            )
+            missing = isinstance(probe, ErrorRejectAbortNack)
+        except ErrorRejectAbortNack:
+            missing = True
+        except Exception as exc:
+            return {**base, "error": failure_message(exc, default="calendar probe failed")}
+
+        if missing:
+            if not create_if_missing:
+                return {**base, "error": "calendar object does not exist"}
+            create_result = await self.create_object(
+                device_instance,
+                "calendar",
+                object_instance,
+                [
+                    {"property": "object-name", "value": str(values["object-name"])},
+                    {"property": "description", "value": str(values["description"])},
+                ],
+                write_timeout,
+            )
+            if create_result.get("error"):
+                return {**base, "create_result": create_result, "error": create_result["error"]}
+            created = True
+
+        writes: list[dict[str, Any]] = []
+        for property_name in ("object-name", "description", "date-list"):
+            error = await self._write_structured_property(
+                app, addr, oid, property_name, values[property_name], write_timeout
+            )
+            row: dict[str, Any] = {"property": property_name, "ok": error is None}
+            if error is not None:
+                row["error"] = error
+            writes.append(row)
+            if error is not None:
+                return {
+                    **base,
+                    "created": created,
+                    "write_results": writes,
+                    "error": error,
+                }
+
+        expected = {
+            "object_name": str(values["object-name"]),
+            "description": str(values["description"]),
+            "date_list": calendar_property_to_json("date-list", values["date-list"]),
+        }
+        out: dict[str, Any] = {
+            **base,
+            "created": created,
+            "write_results": writes,
+        }
+        if include_readback:
+            errors: list[dict[str, Any]] = []
+            readback = await _build_snapshot_style_object_entry(
+                app,
+                addr,
+                device_instance,
+                "calendar",
+                object_instance,
+                write_timeout,
+                errors,
+                read_oid=oid,
+            )
+            compared = {key: readback.get(key) for key in expected}
+            differences = {
+                key: {"expected": expected[key], "actual": compared.get(key)}
+                for key in expected
+                if compared.get(key) != expected[key]
+            }
+            out.update(
+                {
+                    "expected": expected,
+                    "readback": readback,
+                    "verified": not differences and not errors,
+                    "differences": differences,
+                }
+            )
+            if errors:
+                out["readback_errors"] = errors
         return out
 
     async def create_object(

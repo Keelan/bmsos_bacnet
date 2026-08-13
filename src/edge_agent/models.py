@@ -385,3 +385,24 @@ class BacnetClient(Protocol):
         read_chunk_size: Optional[int] = None,
     ) -> dict[str, Any]:
         ...
+
+    async def write_schedule(
+        self,
+        device_instance: int,
+        object_instance: int,
+        schedule: dict[str, Any],
+        write_timeout: float,
+        include_readback: bool = True,
+    ) -> dict[str, Any]:
+        ...
+
+    async def write_calendar(
+        self,
+        device_instance: int,
+        object_instance: int,
+        calendar: dict[str, Any],
+        write_timeout: float,
+        include_readback: bool = True,
+        create_if_missing: bool = True,
+    ) -> dict[str, Any]:
+        ...

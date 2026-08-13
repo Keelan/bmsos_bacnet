@@ -644,6 +644,174 @@ async def run_job(
                     },
                 )
 
+        elif job.type == "write_schedule":
+            p = job.payload
+            dev = int(p["device_instance"])
+            ot = str(p.get("object_type") or "schedule")
+            oi = int(p["object_instance"])
+            schedule = p.get("schedule")
+            include_readback = bool(p.get("include_readback", True))
+            try:
+                if ot.lower().replace("_", "-") != "schedule":
+                    raise ValueError("write_schedule object_type must be schedule")
+                if not isinstance(schedule, dict):
+                    raise ValueError("write_schedule schedule must be an object")
+                result = await asyncio.wait_for(
+                    bacnet.write_schedule(
+                        dev,
+                        oi,
+                        schedule,
+                        settings.request_timeout_seconds,
+                        include_readback=include_readback,
+                    ),
+                    timeout=max(settings.request_timeout_seconds * 20.0, 120.0),
+                )
+                data = result
+                if result.get("error"):
+                    status = "failed"
+                    summary = failure_message(result["error"], default="write_schedule failed")
+                    errors.append(
+                        {
+                            "message": summary,
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                        }
+                    )
+                elif include_readback and result.get("verified") is not True:
+                    status = "failed"
+                    summary = "Schedule readback verification failed"
+                    errors.append(
+                        {
+                            "message": summary,
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                            "differences": result.get("differences", {}),
+                        }
+                    )
+                else:
+                    status = "success"
+                    summary = (
+                        "BACnet schedule written and verified"
+                        if include_readback
+                        else "BACnet schedule written"
+                    )
+                storage.append_write_audit(
+                    job.job_id,
+                    {
+                        "device_instance": dev,
+                        "object_type": ot,
+                        "object_instance": oi,
+                        "outcome": status,
+                        "detail": result,
+                    },
+                )
+            except (ErrorRejectAbortNack, Exception) as exc:
+                status = "failed"
+                summary = "write_schedule failed"
+                data = {
+                    "device_instance": dev,
+                    "object_type": ot,
+                    "object_instance": oi,
+                }
+                errors.append({"message": str(exc), "traceback": traceback.format_exc()})
+                storage.append_write_audit(
+                    job.job_id,
+                    {
+                        "device_instance": dev,
+                        "object_type": ot,
+                        "object_instance": oi,
+                        "outcome": "failed",
+                        "detail": str(exc),
+                    },
+                )
+
+        elif job.type == "write_calendar":
+            p = job.payload
+            dev = int(p["device_instance"])
+            ot = str(p.get("object_type") or "calendar")
+            oi = int(p["object_instance"])
+            calendar = p.get("calendar")
+            include_readback = bool(p.get("include_readback", True))
+            create_if_missing = bool(p.get("create_if_missing", True))
+            try:
+                if ot.lower().replace("_", "-") != "calendar":
+                    raise ValueError("write_calendar object_type must be calendar")
+                if not isinstance(calendar, dict):
+                    raise ValueError("write_calendar calendar must be an object")
+                result = await asyncio.wait_for(
+                    bacnet.write_calendar(
+                        dev,
+                        oi,
+                        calendar,
+                        settings.request_timeout_seconds,
+                        include_readback=include_readback,
+                        create_if_missing=create_if_missing,
+                    ),
+                    timeout=max(settings.request_timeout_seconds * 8.0, 60.0),
+                )
+                data = result
+                if result.get("error"):
+                    status = "failed"
+                    summary = failure_message(result["error"], default="write_calendar failed")
+                    errors.append(
+                        {
+                            "message": summary,
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                        }
+                    )
+                elif include_readback and result.get("verified") is not True:
+                    status = "failed"
+                    summary = "Calendar readback verification failed"
+                    errors.append(
+                        {
+                            "message": summary,
+                            "device_instance": dev,
+                            "object_type": ot,
+                            "object_instance": oi,
+                            "differences": result.get("differences", {}),
+                        }
+                    )
+                else:
+                    status = "success"
+                    summary = (
+                        "BACnet calendar written and verified"
+                        if include_readback
+                        else "BACnet calendar written"
+                    )
+                storage.append_write_audit(
+                    job.job_id,
+                    {
+                        "device_instance": dev,
+                        "object_type": ot,
+                        "object_instance": oi,
+                        "outcome": status,
+                        "detail": result,
+                    },
+                )
+            except (ErrorRejectAbortNack, Exception) as exc:
+                status = "failed"
+                summary = "write_calendar failed"
+                data = {
+                    "device_instance": dev,
+                    "object_type": ot,
+                    "object_instance": oi,
+                }
+                errors.append({"message": str(exc), "traceback": traceback.format_exc()})
+                storage.append_write_audit(
+                    job.job_id,
+                    {
+                        "device_instance": dev,
+                        "object_type": ot,
+                        "object_instance": oi,
+                        "outcome": "failed",
+                        "detail": str(exc),
+                    },
+                )
+
         elif job.type == "create_object":
             p = job.payload
             dev = int(p["device_instance"])

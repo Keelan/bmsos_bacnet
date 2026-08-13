@@ -6,6 +6,12 @@ import hashlib
 from typing import Any, Optional
 
 from edge_agent.models import utc_now_iso
+from edge_agent.bacnet_schedule import (
+    calendar_property_to_json,
+    calendar_write_values,
+    schedule_property_to_json,
+    schedule_write_values,
+)
 
 
 class MockBacnetClient:
@@ -427,6 +433,103 @@ class MockBacnetClient:
             "file_sha256": hashlib.sha256(data).hexdigest(),
             "file_data": data,
         }
+
+    async def write_schedule(
+        self,
+        device_instance: int,
+        object_instance: int,
+        schedule: dict[str, Any],
+        write_timeout: float,
+        include_readback: bool = True,
+    ) -> dict[str, Any]:
+        base = {
+            "device_instance": device_instance,
+            "object_type": "schedule",
+            "object_instance": object_instance,
+        }
+        if device_instance != 2001:
+            return {**base, "error": "device not found (I-Am)"}
+        try:
+            values = schedule_write_values(schedule)
+        except (TypeError, ValueError) as exc:
+            return {**base, "error": str(exc)}
+        expected = {
+            "object_name": str(values["object-name"]),
+            "description": str(values["description"]),
+            "effective_period": schedule_property_to_json(
+                "effective-period", values["effective-period"]
+            ),
+            "weekly_schedule": schedule_property_to_json(
+                "weekly-schedule", values["weekly-schedule"]
+            ),
+            "exception_schedule": schedule_property_to_json(
+                "exception-schedule", values["exception-schedule"]
+            ),
+            "schedule_default": schedule_property_to_json(
+                "schedule-default", values["schedule-default"]
+            ),
+            "references": schedule_property_to_json(
+                "list-of-object-property-references",
+                values["list-of-object-property-references"],
+            ),
+            "priority_for_writing": int(values["priority-for-writing"]),
+            "out_of_service": bool(values["out-of-service"]),
+        }
+        out: dict[str, Any] = {
+            **base,
+            "write_results": [{"property": "schedule-config", "ok": True}],
+        }
+        if include_readback:
+            out.update(
+                {
+                    "expected": expected,
+                    "readback": {**base, **expected},
+                    "verified": True,
+                    "differences": {},
+                }
+            )
+        return out
+
+    async def write_calendar(
+        self,
+        device_instance: int,
+        object_instance: int,
+        calendar: dict[str, Any],
+        write_timeout: float,
+        include_readback: bool = True,
+        create_if_missing: bool = True,
+    ) -> dict[str, Any]:
+        base = {
+            "device_instance": device_instance,
+            "object_type": "calendar",
+            "object_instance": object_instance,
+        }
+        if device_instance != 2001:
+            return {**base, "error": "device not found (I-Am)"}
+        try:
+            values = calendar_write_values(calendar)
+        except (TypeError, ValueError) as exc:
+            return {**base, "error": str(exc)}
+        expected = {
+            "object_name": str(values["object-name"]),
+            "description": str(values["description"]),
+            "date_list": calendar_property_to_json("date-list", values["date-list"]),
+        }
+        out: dict[str, Any] = {
+            **base,
+            "created": bool(create_if_missing),
+            "write_results": [{"property": "calendar-config", "ok": True}],
+        }
+        if include_readback:
+            out.update(
+                {
+                    "expected": expected,
+                    "readback": {**base, **expected, "present_value": False},
+                    "verified": True,
+                    "differences": {},
+                }
+            )
+        return out
 
     async def create_object(
         self,
