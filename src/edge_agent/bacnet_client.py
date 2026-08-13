@@ -1822,6 +1822,11 @@ def _bacnet_property_identifier(prop: str) -> str:
     p = str(prop).strip()
     if not p:
         return p
+    # BACpypes3's PropertyIdentifier table does not currently expose the
+    # standard Trend Log Log_Interval name.  BACnet property 134 is the
+    # interoperable wire identifier used by YABE and KMC Conquest.
+    if p.lower().replace('_', '-').replace(' ', '-') in {'logging-interval', 'log-interval'}:
+        return '134'
     if not any(c.isupper() for c in p):
         return p.lower().replace("_", "-")
     return _camel_to_kebab(p)
