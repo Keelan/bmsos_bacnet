@@ -115,7 +115,7 @@ def _object_identifier_to_json(obj: Any) -> Any:
 
 
 def _object_property_reference_to_json(obj: Any) -> Optional[dict[str, Any]]:
-    """Decode BACpypes ObjectPropertyReference for snapshot/import."""
+    """Decode BACpypes Object/DeviceObjectPropertyReference for snapshot/import."""
     oid = getattr(obj, "objectIdentifier", None)
     if oid is None:
         return None
@@ -130,6 +130,9 @@ def _object_property_reference_to_json(obj: Any) -> Optional[dict[str, Any]]:
             out["propertyArrayIndex"] = int(arr)
         except (TypeError, ValueError):
             out["propertyArrayIndex"] = arr
+    device = getattr(obj, "deviceIdentifier", None)
+    if device is not None:
+        out["deviceIdentifier"] = _object_identifier_to_json(device)
     return out
 
 
@@ -172,7 +175,6 @@ def to_json_safe(obj: Any) -> Any:
         and hasattr(obj, "propertyIdentifier")
         and not hasattr(obj, "setpointReference")
         and "Reference" in type_name
-        and "Device" not in type_name
     ):
         decoded = _object_property_reference_to_json(obj)
         if decoded is not None:
@@ -189,6 +191,7 @@ def to_json_safe(obj: Any) -> Any:
     if callable(cast_out):
         for cls_name, import_path in (
             ("ObjectPropertyReference", "bacpypes3.basetypes"),
+            ("DeviceObjectPropertyReference", "bacpypes3.basetypes"),
             ("SetpointReference", "bacpypes3.basetypes"),
             ("Real", "bacpypes3.primitivedata"),
             ("Unsigned", "bacpypes3.primitivedata"),

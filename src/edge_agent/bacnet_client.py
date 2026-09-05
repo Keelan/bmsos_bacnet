@@ -40,6 +40,7 @@ from bacpypes3.basetypes import (
     AtomicWriteFileRequestAccessMethodChoiceStreamAccess,
     BinaryPV,
     CreateObjectRequestObjectSpecifier,
+    DeviceObjectPropertyReference,
     EngineeringUnits,
     EventState,
     ObjectTypesSupported,
@@ -1822,13 +1823,16 @@ def _bacnet_property_identifier(prop: str) -> str:
     p = str(prop).strip()
     if not p:
         return p
+    normalized = p.lower().replace("_", "-").replace(" ", "-")
     # BACpypes3's PropertyIdentifier table does not currently expose the
     # standard Trend Log Log_Interval name.  BACnet property 134 is the
     # interoperable wire identifier used by YABE and KMC Conquest.
-    if p.lower().replace('_', '-').replace(' ', '-') in {'logging-interval', 'log-interval'}:
+    if normalized in {"logging-interval", "log-interval"}:
         return '134'
+    if " " in p or "_" in p:
+        return normalized
     if not any(c.isupper() for c in p):
-        return p.lower().replace("_", "-")
+        return normalized
     return _camel_to_kebab(p)
 
 
@@ -2344,6 +2348,12 @@ def _normalize_write_value_for_bacnet(
     priority: Optional[int],
     array_index: Optional[int],
 ) -> Any:
+    if pid == "log-device-object-property":
+        if isinstance(val, list):
+            return ArrayOf(DeviceObjectPropertyReference)(
+                [_trend_log_reference_from_json(item) for item in val]
+            )
+        return _trend_log_reference_from_json(val)
     if val is not None:
         return val
     if pid == "priority-array" and array_index is not None:
@@ -2351,6 +2361,118 @@ def _normalize_write_value_for_bacnet(
     if pid == "present-value" and priority is not None:
         return _bacnet_relinquish_present_value_as_null()
     return val
+
+
+def _trend_log_reference_from_json(value: Any) -> DeviceObjectPropertyReference:
+    if isinstance(value, DeviceObjectPropertyReference):
+        return value
+    if not isinstance(value, dict):
+        raise TypeError("trend log source must be an object")
+
+    raw_oid = value.get("objectIdentifier", value.get("objectID"))
+    object_identifier = _trend_log_object_identifier(raw_oid)
+    if object_identifier is None:
+        raise ValueError("trend log source requires a valid object identifier")
+
+    raw_property = value.get(
+        "propertyIdentifier",
+        value.get("propertyID", "present-value"),
+    )
+    property_identifier = _bacnet_property_identifier(str(raw_property))
+    if not property_identifier:
+        raise ValueError("trend log source requires a valid property identifier")
+
+    kwargs: dict[str, Any] = {
+        "objectIdentifier": ObjectIdentifier(object_identifier),
+        "propertyIdentifier": PropertyIdentifier(property_identifier),
+    }
+
+    raw_index = value.get("propertyArrayIndex", value.get("Index"))
+    if raw_index not in (None, "", 4294967295, "4294967295"):
+        kwargs["propertyArrayIndex"] = Unsigned(int(raw_index))
+
+    raw_device_identifier = value.get("deviceIdentifier")
+    if raw_device_identifier is not None:
+        device_identifier = _trend_log_object_identifier(
+            raw_device_identifier,
+            default_object_type="device",
+        )
+        if device_identifier is None:
+            raise ValueError("trend log source has an invalid device identifier")
+        kwargs["deviceIdentifier"] = ObjectIdentifier(device_identifier)
+    else:
+        raw_device_instance = value.get("deviceInstance", value.get("DeviceInstance"))
+        use_device = value.get("useDeviceInstance", value.get("UseDeviceInstance"))
+        if raw_device_instance not in (None, "", 0, "0") and use_device is not False:
+            kwargs["deviceIdentifier"] = ObjectIdentifier(
+                f"device,{int(raw_device_instance)}"
+            )
+
+    return DeviceObjectPropertyReference(**kwargs)
+
+
+def _trend_log_object_identifier(
+    value: Any,
+    default_object_type: Optional[str] = None,
+) -> Optional[str]:
+    if isinstance(value, ObjectIdentifier):
+        return f"{value[0]},{int(value[1])}"
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return f"{value[0]},{int(value[1])}"
+    if isinstance(value, dict):
+        object_type = value.get(
+            "ObjectType",
+            value.get("m_objectType", default_object_type),
+        )
+        instance = value.get("ObjectInstance", value.get("m_objectInstance"))
+        if object_type is None or instance is None:
+            return None
+        if isinstance(object_type, int) or str(object_type).isdigit():
+            object_type = {
+                0: "analog-input",
+                1: "analog-output",
+                2: "analog-value",
+                3: "binary-input",
+                4: "binary-output",
+                5: "binary-value",
+                8: "device",
+                13: "multi-state-input",
+                14: "multi-state-output",
+                19: "multi-state-value",
+            }.get(int(object_type))
+            if object_type is None:
+                return None
+        return f"{object_type},{int(instance)}"
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if "," in text:
+        return text
+    if default_object_type is not None and text.isdigit():
+        return f"{default_object_type},{int(text)}"
+
+    match = re.fullmatch(
+        r"(AI|AO|AV|BI|BO|BV|MI|MO|MV|MSV)(\d+)",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    object_type = {
+        "AI": "analog-input",
+        "AO": "analog-output",
+        "AV": "analog-value",
+        "BI": "binary-input",
+        "BO": "binary-output",
+        "BV": "binary-value",
+        "MI": "multi-state-input",
+        "MO": "multi-state-output",
+        "MV": "multi-state-value",
+        "MSV": "multi-state-value",
+    }[match.group(1).upper()]
+
+    return f"{object_type},{int(match.group(2))}"
 
 
 async def _list_of_initial_values_for_create_object(
