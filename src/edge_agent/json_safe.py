@@ -57,11 +57,17 @@ def _norm_error_token(value: Optional[str]) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
+_ALREADY_EXISTS_CODES = frozenset(
+    {"objectalreadyexists", "objectidentifieralreadyexists"}
+)
+
+
 def is_object_already_exists(obj: Any) -> bool:
     _error_class, error_code = bacnet_error_class_code(obj)
-    if _norm_error_token(error_code) == "objectalreadyexists":
+    if _norm_error_token(error_code) in _ALREADY_EXISTS_CODES:
         return True
-    return "objectalreadyexists" in _norm_error_token(failure_message(obj, default=""))
+    token = _norm_error_token(failure_message(obj, default=""))
+    return any(code in token for code in _ALREADY_EXISTS_CODES)
 
 
 def failure_message(obj: Any, *, default: str = "operation failed") -> str:
