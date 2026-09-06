@@ -848,6 +848,9 @@ async def run_job(
                             cr.get("error"), default="create_object failed"
                         )
                         errors.append({"message": summary, "device_instance": dev})
+                    elif cr.get("already_exists"):
+                        status = "success"
+                        summary = "Object already exists"
                     else:
                         status = "success"
                         summary = "Object created"

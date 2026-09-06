@@ -78,7 +78,7 @@ _PROPRIETARY_WRITE_TYPES: dict[int, type] = {
     647: Enumerated,  # termination (AI/BI)
 }
 
-from edge_agent.json_safe import failure_message, to_json_safe
+from edge_agent.json_safe import failure_message, is_object_already_exists, to_json_safe
 from edge_agent.bacnet_schedule import (
     WEEKDAYS,
     calendar_property_to_json,
@@ -5505,7 +5505,7 @@ class BacnetPypesClient:
             ],
             write_timeout,
         )
-        created = not bool(create_result.get("error"))
+        created = bool(create_result.get("created"))
 
         expected: dict[str, Any] = {
             "object_name": str(values["object-name"]),
@@ -5678,7 +5678,7 @@ class BacnetPypesClient:
             )
             if create_result.get("error"):
                 return {**base, "create_result": create_result, "error": create_result["error"]}
-            created = True
+            created = not bool(create_result.get("already_exists"))
 
         writes: list[dict[str, Any]] = []
         for property_name in ("object-name", "description", "date-list"):
@@ -5799,24 +5799,18 @@ class BacnetPypesClient:
                 timeout=write_timeout,
             )
         except ErrorRejectAbortNack as err:
-            return {
-                "device_instance": device_instance,
-                "object_type": _object_type_for_json(object_type),
-                "error": failure_message(err, default="CreateObject rejected"),
-            }
+            return self._create_object_outcome(
+                device_instance, object_type, object_instance, err, "CreateObject rejected"
+            )
         except Exception as e:
-            return {
-                "device_instance": device_instance,
-                "object_type": _object_type_for_json(object_type),
-                "error": failure_message(e, default="CreateObject failed"),
-            }
+            return self._create_object_outcome(
+                device_instance, object_type, object_instance, e, "CreateObject failed"
+            )
 
         if isinstance(response, ErrorRejectAbortNack):
-            return {
-                "device_instance": device_instance,
-                "object_type": _object_type_for_json(object_type),
-                "error": failure_message(response, default="CreateObject rejected"),
-            }
+            return self._create_object_outcome(
+                device_instance, object_type, object_instance, response, "CreateObject rejected"
+            )
         if not isinstance(response, CreateObjectACK):
             return {
                 "device_instance": device_instance,
@@ -5830,10 +5824,42 @@ class BacnetPypesClient:
             "device_instance": device_instance,
             "object_type": _object_type_for_json(ot_label),
             "object_instance": int(created[1]),
+            "created": True,
+            "already_exists": False,
+            "status": "created",
         }
         if object_instance is not None:
             out["requested_object_instance"] = int(object_instance)
         return out
+
+    def _create_object_outcome(
+        self,
+        device_instance: int,
+        object_type: str,
+        object_instance: Optional[int],
+        err: Any,
+        default: str,
+    ) -> dict[str, Any]:
+        if is_object_already_exists(err):
+            out: dict[str, Any] = {
+                "device_instance": device_instance,
+                "object_type": _object_type_for_json(object_type),
+                "status": "already_exists",
+                "already_exists": True,
+                "created": False,
+            }
+            if object_instance is not None:
+                out["object_instance"] = int(object_instance)
+                out["requested_object_instance"] = int(object_instance)
+            return out
+        payload: dict[str, Any] = {
+            "device_instance": device_instance,
+            "object_type": _object_type_for_json(object_type),
+            "error": failure_message(err, default=default),
+        }
+        if object_instance is not None:
+            payload["object_instance"] = int(object_instance)
+        return payload
 
     async def delete_object(
         self,

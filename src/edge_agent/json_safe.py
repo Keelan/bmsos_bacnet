@@ -6,6 +6,64 @@ import re
 from typing import Any, Optional, Type
 
 
+def _enum_token(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    for attr in ("attr", "name"):
+        token = getattr(value, attr, None)
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    if not text or text.startswith("<"):
+        return None
+    return text
+
+
+def bacnet_error_class_code(obj: Any) -> tuple[Optional[str], Optional[str]]:
+    """Pull errorClass / errorCode off Error, CreateObjectError.errorType, or wrappers."""
+    current = obj
+    seen: set[int] = set()
+    for _ in range(6):
+        if current is None:
+            break
+        ident = id(current)
+        if ident in seen:
+            break
+        seen.add(ident)
+        error_class = _enum_token(getattr(current, "errorClass", None))
+        error_code = _enum_token(getattr(current, "errorCode", None))
+        if error_class or error_code:
+            return error_class, error_code
+        nested = getattr(current, "errorType", None)
+        if nested is not None and nested is not current:
+            current = nested
+            continue
+        inner = getattr(current, "error", None)
+        if inner is not None and inner is not current:
+            current = inner
+            continue
+        break
+    return None, None
+
+
+def _norm_error_token(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def is_object_already_exists(obj: Any) -> bool:
+    _error_class, error_code = bacnet_error_class_code(obj)
+    if _norm_error_token(error_code) == "objectalreadyexists":
+        return True
+    return "objectalreadyexists" in _norm_error_token(failure_message(obj, default=""))
+
+
 def failure_message(obj: Any, *, default: str = "operation failed") -> str:
     """
     BACnet Error/Reject/Abort and some stack types can stringify to empty text.
@@ -16,18 +74,25 @@ def failure_message(obj: Any, *, default: str = "operation failed") -> str:
     if isinstance(obj, str):
         t = obj.strip()
         return t if t else default
+    error_class, error_code = bacnet_error_class_code(obj)
+    if error_class or error_code:
+        if error_class and error_code:
+            return f"{error_class}: {error_code}"
+        return error_code or error_class or default
     try:
         s = str(obj).strip()
     except Exception:
         s = ""
-    if s:
+    if s and not s.startswith("<"):
         return s
     try:
         r = repr(obj).strip()
     except Exception:
         r = ""
-    if r and r not in ("", "''", '""'):
+    if r and r not in ("", "''", '""') and not r.startswith("<"):
         return r
+    if error_class or error_code:
+        return f"{error_class or 'error'}: {error_code or default}"
     return f"{default} ({type(obj).__name__})"
 
 # BACpypes constructed values often stringify to Python repr, not a BACnet value.
